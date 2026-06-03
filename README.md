@@ -1,6 +1,5 @@
-# Capstone: AI Forum Voting App
-
-## The team
+# DevTalk: AI Forum Voting App
+## Team
 - Tyran
 - Nicole
 - Devyn
@@ -12,13 +11,18 @@
 ## A description of the app
 - A full-stack web application where users create accounts, start forums based on questions or problems, vote on responses, and view AI-generated summaries after forums close.
 - Users can register, log in, post anonymously, create/join forums, upvote/downvote responses, and view AI summaries.
-- Admins can manage forums and moderate content.
-- Core features:
+- Admin functionality is part of the roadmap for managing forums and moderating content.
+
+## Core features:
   - Forum creation and participation
   - Voting on responses
   - AI-powered summary and action roadmap after forum closure
-  - Authentication (user and admin)
-- Key technologies:
+  - Authentication workflows
+ 
+## My contribution
+My primary focus was supporting AI workflow integration, structured OpenAI API outputs, Firebase-connected front-end workflows, forum/message testing, and usability improvements. I also contributed to documentation and testing flows to make the project easier to understand and maintain.
+
+## Tech Stack:
   - React, React Router, TypeScript, Vite, TailwindCSS
   - Firebase (Firestore, Auth)
   - OpenAI API for AI summaries
@@ -34,7 +38,7 @@
   ```sh
   npm install
   ```
-- Set up environment variables in `.env.local` (see Firebase and OpenAI keys)
+- Set up environment variables in `.env.local` using `.env.example` as a template.
 - Start development server:
   ```sh
   npm run dev
@@ -48,60 +52,30 @@
   npm test
   ```
 
-## Known issues
-- User saving between sessions and pages
-- Anonymous Mode
-- Account Logout
-- Account Login
-- Account Registration
-- User Registration
-- Show Home Page With Forums Listed And Ability To Login
-- Showing Invisible Name For Anonymous
-- Revisit Forums To See Messages And Results
-- Creating Forum With Desired Requirements
-- Saving Accounts On Firebase
-- Skeleton Of An Account
-- Name Of App/Website?
-- UI For Forum Page
-- Show End Results In Forum from OpenAI
-- Upvote/downvote Forums (UI Only)
-- List Messages In Forum
-- Forum Template/Showing (title, description, author)
-- Give Suggestions From OpenAI Prompt Data
-- Give A Summary Using OpenAI From Result
-- Result Encompasses Forum, Voting, and Messages Data
-- Upvoting/Downvoting Responsiveness
-- Realtime Updates
-- Give Feedback to Message
-- User Receives Messages To Forum
+## Current Status & Roadmap
 
-## Roadmap features
-- Showing Invisible Name For Anonymous
-- Account Logout
-- UI For Forum Page
-- User Receives Messages To Forum
-- User saving between sessions and pages
-- Revisit Forums To See Messages And Results
-- Upvoting/Downvoting Responsiveness
-- Users Send Messages To Forum
-- Skeleton Of An Account
-- Upvote/downvote Forums (UI Only)
-- Skeleton For OpenAI
-- Realtime Updates
-- Name Of App/Website?
-- Edit/Delete Feature For Admins
-- Show Home Page With Forums Listed And Ability To Login
-- Skeleton For Messaging
-- Forum Template/Showing (title, description, author)
-- User Registration
-- Saving Accounts On Firebase
-- Result Encompasses Forum, Voting, and Messages Data
-- Account Login
-- Creating Forum With Desired Requirements
-- Give A Summary Using OpenAI From Result
+DevTalk is an active project that I continue to improve as I refine the product experience, reliability, and AI workflow quality.
+
+### Currently implemented
+- Forum creation and browsing workflows
+- User-facing discussion and message flows
+- Voting interaction flows
+- Firebase-connected account and forum data structure
+- OpenAI-powered analysis for summaries, suggestions, and action roadmaps
+- Forum result pages that combine discussion, voting, and message context
+- Automated tests across forum creation, browsing, messaging, routing, and service logic
+
+### In progress
+- Improving login, logout, registration, and session persistence
+- Strengthening Firebase saving and account data reliability
+- Refining anonymous mode and display-name handling
+- Improving voting responsiveness and real-time updates
+- Enhancing forum page UI and result presentation
+- Expanding admin edit/delete functionality
+- Improving message feedback and notification flows
+
 
 ## Credits
 - Team: Tyran, Nicole, Devyn, Jayden
 - Libraries: [React](https://react.dev/), [React Router](https://reactrouter.com/), [Firebase](https://firebase.google.com/), [OpenAI](https://platform.openai.com/), [TailwindCSS](https://tailwindcss.com/), [Jest](https://jestjs.io/)
 - APIs: OpenAI, Firebase
-- TODO: Add dataset/icon/template credits if used
