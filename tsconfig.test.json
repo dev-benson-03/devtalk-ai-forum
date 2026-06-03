@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "verbatimModuleSyntax": false,
+    "types": ["node", "vite/client", "jest", "@testing-library/jest-dom"],
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["**/*.test.ts", "**/*.test.tsx", "app/**/__tests__/**/*", "app/**/test-utils/**/*"]
+}
