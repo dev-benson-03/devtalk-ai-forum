@@ -11,7 +11,6 @@ import { AnalysisService, type MessageAnalysisResponse } from '../services/Analy
 
 interface TeaModalProps {
   onClose: () => void;
-  messages: Message[];
   forumId: string;
   forumTitle: string;
   forumDescription?: string;

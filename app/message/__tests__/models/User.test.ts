@@ -3,7 +3,7 @@
  * Jest tests for the User model
  */
 
-import { User, UserData } from '../../models/User';
+import { User, type UserData } from '../../models/User';
 
 describe('User Model', () => {
   // Test data setup

@@ -3,7 +3,7 @@
  * Unit tests for Message model with ~80% coverage
  */
 
-import { Message, MessageData, ReactionData } from '../../models/Message';
+import { Message, type MessageData, type ReactionData } from '../../models/Message';
 
 describe('Message', () => {
   let mockMessageData: MessageData;

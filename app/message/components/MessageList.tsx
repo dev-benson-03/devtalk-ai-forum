@@ -201,7 +201,6 @@ export const MessageList: React.FC<MessageListProps> = ({
       {showAnalysisModal && (
         <TeaModal 
           onClose={() => setShowAnalysisModal(false)} 
-          messages={validMessages}
           forumId="forum_react_learning"
           forumTitle="React Learning Forum"
           forumDescription="A place to share React tips, tricks, and best practices"

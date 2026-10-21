@@ -17,17 +17,11 @@ jest.mock('firebase/firestore', () => ({
 
 }));
 
-const mockAnalysis = {
-  totalMessages: 2,
-  uniqueAuthors: 2,
-  summary: 'Summary of messages',
-  actionRoadmap: ['Step 1', 'Step 2']
-};
-
-jest.mock('../../../../api/analyzeMessages', () => ({
-  default: {
-    analyzeMessages: jest.fn(() => Promise.resolve(mockAnalysis))
-  }
+// The analysis request fails, so the modal shows its error state
+jest.mock('../services/AnalysisService', () => ({
+  AnalysisService: jest.fn().mockImplementation(() => ({
+    analyzeMessages: jest.fn(() => Promise.reject(new Error('Failed to analyze messages')))
+  }))
 }));
 
 const defaultProps = {
@@ -42,7 +36,7 @@ const defaultProps = {
 describe('TeaModal', () => {
   it('shows loading then analysis results', async () => {
     await act(async () => {
-      render(<TeaModal {...defaultProps} messages={[]} />);
+      render(<TeaModal {...defaultProps} />);
     });
     // Wait for analysis to appear
     await act(async () => {
@@ -58,7 +52,7 @@ describe('TeaModal', () => {
 
   it('shows forum metadata', async () => {
     await act(async () => {
-      render(<TeaModal {...defaultProps} messages={[]} />);
+      render(<TeaModal {...defaultProps} />);
     });
     expect(screen.getByText('Forum Title')).toBeInTheDocument();
     expect(screen.getByText('Forum Description')).toBeInTheDocument();
@@ -68,7 +62,7 @@ describe('TeaModal', () => {
 
   it('calls onClose when close button is clicked', async () => {
     await act(async () => {
-      render(<TeaModal {...defaultProps} messages={[]} />);
+      render(<TeaModal {...defaultProps} />);
     });
     const closeBtn = screen.getByRole('button', { name: /✕/i });
     closeBtn.click();
@@ -80,7 +74,7 @@ describe('TeaModal', () => {
     const { getDocs } = require('firebase/firestore');
     getDocs.mockImplementationOnce(() => Promise.resolve({ docs: [] }));
     await act(async () => {
-      render(<TeaModal {...defaultProps} messages={[]} />);
+      render(<TeaModal {...defaultProps} />);
     });
     expect(screen.getByText(/Fetching the tea/i)).toBeInTheDocument();
     // No analysis should be shown
