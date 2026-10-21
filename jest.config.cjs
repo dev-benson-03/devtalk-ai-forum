@@ -1,3 +1,6 @@
+// Timestamp assertions in the tests were written for US Eastern time
+process.env.TZ = 'America/New_York';
+
 /** @type {import('jest').Config} */
 module.exports = {
   preset: "ts-jest",
