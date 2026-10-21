@@ -306,7 +306,6 @@ export default function ForumDetailPage() {
             {showTeaModal && (
   <TeaModal
     onClose={() => setShowTeaModal(false)}
-    messages={comments}
     forumId={forumId ?? ""}
     forumTitle={forum?.title || ""}
     forumDescription={forum?.description}
