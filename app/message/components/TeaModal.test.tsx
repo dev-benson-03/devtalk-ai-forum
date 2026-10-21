@@ -17,17 +17,11 @@ jest.mock('firebase/firestore', () => ({
 
 }));
 
-const mockAnalysis = {
-  totalMessages: 2,
-  uniqueAuthors: 2,
-  summary: 'Summary of messages',
-  actionRoadmap: ['Step 1', 'Step 2']
-};
-
-jest.mock('../../../../api/analyzeMessages', () => ({
-  default: {
-    analyzeMessages: jest.fn(() => Promise.resolve(mockAnalysis))
-  }
+// The analysis request fails, so the modal shows its error state
+jest.mock('../services/AnalysisService', () => ({
+  AnalysisService: jest.fn().mockImplementation(() => ({
+    analyzeMessages: jest.fn(() => Promise.reject(new Error('Failed to analyze messages')))
+  }))
 }));
 
 const defaultProps = {
