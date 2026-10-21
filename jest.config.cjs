@@ -8,7 +8,9 @@ module.exports = {
   setupFilesAfterEnv: ["./jest.setup.js"],
   moduleNameMapper: {
     "\\.(css|less|scss|sass)$": "identity-obj-proxy",
-    "^~/(.*)$": "<rootDir>/app/$1"
+    "^~/(.*)$": "<rootDir>/app/$1",
+    // config.js uses import.meta.env, which Jest can't parse
+    "^(.*)/firebase/config(\\.js)?$": "<rootDir>/app/firebase/config.jest.js"
   },
   transform: {
     '^.+\\.tsx?$': ['ts-jest', {
