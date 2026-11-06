@@ -1,10 +1,10 @@
 import { onAuthStateChanged, type User } from "firebase/auth";
-import { Timestamp } from "firebase/firestore";
 import { useEffect, useState } from "react";
 import { Footer } from "../components/footer/footer";
 import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useFirestore } from "../hooks/useFirestore";
+import { buildForumDocument } from "./forum-document";
 
 export default function CreateForumPage() {
     const { createForum } = useFirestore();
@@ -48,34 +48,9 @@ export default function CreateForumPage() {
         setIsLoading(true);
 
         try {
-            // Calculate end time based on time limit (fractional hours supported)
-            const endTime = new Date();
-            endTime.setMinutes(endTime.getMinutes() + formData.timeLimit * 60);
-
-            // Determine user identity
-            let creatorId = user?.uid || "anonymous";
-            let creatorName = "Anonymous User";
-            if (typeof window !== "undefined") {
-                const isAnonymous = window.sessionStorage.getItem("anonymous");
-                if (isAnonymous === "false" && user) {
-                    creatorName = user.displayName || user.email || "User";
-                }
-            }
-
-            const forumData = {
-                title: formData.title,
-                description: formData.description,
-                question: formData.question,
-                creatorId,
-                creatorName,
-                endTime: Timestamp.fromDate(endTime),
-                isActive: true,
-                isAdminDeleted: false,
-                tags: formData.category ? [formData.category] : [],
-                messages: [""],
-                summary: "",
-                actionRoadmap: [""],
-            };
+            const anonymousPreference =
+                typeof window !== "undefined" ? window.sessionStorage.getItem("anonymous") : null;
+            const forumData = buildForumDocument(formData, user, anonymousPreference);
 
             const forumId = await createForum(forumData);
             

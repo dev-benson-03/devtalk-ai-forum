@@ -13,6 +13,7 @@ jest.mock('firebase/firestore', () => ({
   onSnapshot: jest.fn(),
   orderBy: jest.fn(),
   query: jest.fn(),
+  runTransaction: jest.fn(),
   serverTimestamp: jest.fn(),
   Timestamp: jest.fn(),
   updateDoc: jest.fn(async () => {}),
@@ -48,6 +49,23 @@ describe('useFirestore', () => {
     render(<HookTest callback={h => (hook = h)} />);
     await hook.deleteForum('forum123');
     expect(require('firebase/firestore').deleteDoc).toHaveBeenCalled();
+  });
+
+  it('createComment writes the comment and count in one transaction', async () => {
+    const firestore = require('firebase/firestore');
+    const tx = {
+      get: jest.fn(async () => ({ exists: () => true, data: () => ({ commentCount: 4 }) })),
+      set: jest.fn(),
+      update: jest.fn(),
+    };
+    firestore.doc.mockImplementation((_db: unknown, col: string, id: string) => ({ col, id }));
+    firestore.runTransaction.mockImplementation(async (_db: unknown, fn: any) => fn(tx));
+    let hook: any;
+    render(<HookTest callback={h => (hook = h)} />);
+    const id = await hook.createComment({ forumId: 'f1', userId: 'u1', userName: 'Anonymous User', content: 'Hi' });
+    expect(id).toBe('f1_5');
+    expect(tx.set).toHaveBeenCalledWith({ col: 'comments', id: 'f1_5' }, expect.objectContaining({ userId: 'u1', upvotes: 0 }));
+    expect(tx.update).toHaveBeenCalledWith({ col: 'forums', id: 'f1' }, { commentCount: 5 });
   });
 
   it('getForum returns forum data if exists', async () => {
@@ -182,6 +200,19 @@ describe('useForums', () => {
     expect(result.forums[0].id).toBe('f1');
     expect(result.loading).toBe(false);
     expect(result.error).toBe(null);
+  });
+
+  it('asks Firestore only for active, not admin-deleted forums (rules are not filters)', () => {
+    const firestore = require('firebase/firestore');
+    firestore.onSnapshot.mockImplementation(() => jest.fn());
+    function Test() {
+      useForums();
+      return null;
+    }
+    render(<Test />);
+    expect(firestore.where).toHaveBeenCalledWith('isActive', '==', true);
+    expect(firestore.where).toHaveBeenCalledWith('isAdminDeleted', '==', false);
+    expect(firestore.orderBy).not.toHaveBeenCalled();
   });
 
   it('handles error in onSnapshot error callback', () => {

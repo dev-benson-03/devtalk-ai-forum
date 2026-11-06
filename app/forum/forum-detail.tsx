@@ -6,6 +6,7 @@ import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
+import { authorIdentity } from "./author-identity";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -47,19 +48,13 @@ export default function ForumDetailPage() {
         setIsSubmitting(true);
         
         try {
-            // Determine user identity for comment
-            let userId = user?.uid || "anonymous";
-            let userName = "Anonymous User";
-            if (typeof window !== "undefined") {
-                const isAnonymous = window.sessionStorage.getItem("anonymous");
-                if (isAnonymous === "false" && user) {
-                    userName = user.displayName || user.email || "User";
-                }
-            }
+            const anonymousPreference =
+                typeof window !== "undefined" ? window.sessionStorage.getItem("anonymous") : null;
+            const author = authorIdentity(user, anonymousPreference);
             await createComment({
                 forumId: forumId,
-                userId,
-                userName,
+                userId: author.id,
+                userName: author.name,
                 content: newMessage.trim(),
             });
             
@@ -285,6 +280,7 @@ export default function ForumDetailPage() {
                                     className="p-4 text-gray-900  bg-gray-50  rounded-lg border border-gray-200  focus:ring-2 focus:ring-blue-600 transition-all"
                                     rows={4}
                                     placeholder="Write your message here..."
+                                    maxLength={5000}
                                     required
                                 ></textarea>
                                 <button

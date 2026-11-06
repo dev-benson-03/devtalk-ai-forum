@@ -6,6 +6,8 @@ module.exports = {
   preset: "ts-jest",
   testEnvironment: "jsdom",
   setupFilesAfterEnv: ["./jest.setup.js"],
+  // Firestore rules tests need the emulator: run them with `npm run test:rules`
+  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/tests/firestore-rules/"],
   moduleNameMapper: {
     "\\.(css|less|scss|sass)$": "identity-obj-proxy",
     "^~/(.*)$": "<rootDir>/app/$1",

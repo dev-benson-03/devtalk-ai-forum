@@ -4,11 +4,8 @@ import {
   deleteDoc,
   doc,
   getDoc,
-  increment,
   onSnapshot,
-  orderBy,
   query,
-  serverTimestamp,
   Timestamp,
   updateDoc,
   where
@@ -16,6 +13,7 @@ import {
 import { useCallback, useEffect, useState } from 'react';
 // @ts-ignore
 import { db } from '../firebase';
+import { createCommentRecord, listedForumsQuery } from './forum-data';
 
 // Types for our forum data structure
 export interface Forum {
@@ -93,22 +91,10 @@ export function useFirestore() {
   };
 
   // Comment operations
+  // Comment + commentCount in one transaction (see createCommentRecord for why)
   const createComment = async (commentData: Omit<Comment, 'id' | 'createdAt' | 'upvotes' | 'downvotes'>) => {
     try {
-      const docRef = await addDoc(collection(db, 'comments'), {
-        ...commentData,
-        createdAt: serverTimestamp(),
-        upvotes: 0,
-        downvotes: 0,
-      });
-      
-      // Update comment count in forum
-      const forumRef = doc(db, 'forums', commentData.forumId);
-      await updateDoc(forumRef, {
-        commentCount: increment(1)
-      });
-      
-      return docRef.id;
+      return await createCommentRecord(db, commentData);
     } catch (error) {
       console.error('Error creating comment:', error);
       throw error;
@@ -147,11 +133,8 @@ export function useForums() {
 
 
   useEffect(() => {
-    // Simplified query to avoid index requirement
-    const forumsQuery = query(
-      collection(db, 'forums'),
-      orderBy("endTime", "desc"));
-    
+    // Only active, not admin-deleted forums: the rules allow no broader query
+    const forumsQuery = listedForumsQuery(db);
 
     const unsubscribe = onSnapshot(
       forumsQuery,
