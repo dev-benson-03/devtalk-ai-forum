@@ -1,10 +1,11 @@
 import { onAuthStateChanged, type User } from "firebase/auth";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Footer } from "../components/footer/footer";
 import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useFirestore } from "../hooks/useFirestore";
-import { buildForumDocument } from "./forum-document";
+import { FORUM_CATEGORIES, FORUM_TIME_LIMITS } from "./forum-options";
+import { newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function CreateForumPage() {
     const { createForum } = useFirestore();
@@ -18,17 +19,9 @@ export default function CreateForumPage() {
         timeLimit: .083, // hours
     });
 
-    const categories = [
-        "Technology",
-        "Programming", 
-        "Career Advice",
-        "Education",
-        "AI/Machine Learning",
-        "Web Development",
-        "Mobile Development",
-        "General Discussion",
-        "Other"
-    ];
+    const categories = FORUM_CATEGORIES;
+    // One ID per draft: a retried submission can't create a second forum
+    const requestId = useRef<string | null>(null);
 
 
     // Set up auth state listener once on mount
@@ -48,17 +41,24 @@ export default function CreateForumPage() {
         setIsLoading(true);
 
         try {
-            const anonymousPreference =
-                typeof window !== "undefined" ? window.sessionStorage.getItem("anonymous") : null;
-            const forumData = buildForumDocument(formData, user, anonymousPreference);
+            requestId.current ??= newRequestId();
+            // The server checks the content, sets the author from the signed-in
+            // account and writes the forum
+            await createForum({
+                title: formData.title,
+                description: formData.description,
+                question: formData.question,
+                category: formData.category,
+                timeLimitHours: formData.timeLimit,
+                anonymous: prefersAnonymous(),
+                requestId: requestId.current,
+            });
 
-            const forumId = await createForum(forumData);
-            
             // Redirect to the forums page after successful creation
             window.location.href = '/forums';
         } catch (error) {
-            console.error("Failed to create forum:", error);
-            alert("Failed to create forum. Please try again.");
+            // The draft stays in the form so it can be revised and resubmitted
+            alert(publishErrorMessage(error, "Failed to create forum. Please try again."));
         } finally {
             setIsLoading(false);
         }
@@ -162,16 +162,9 @@ export default function CreateForumPage() {
                                 onChange={handleInputChange}
                                 className="w-full px-4 py-2 border border-gray-300  rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent  "
                             >
-                                <option value={0.083}>5 minutes</option>
-                                <option value={0.25}>15 minutes</option>
-                                <option value={0.5}>30 minutes</option>
-                                <option value={1}>1 hour</option>
-                                <option value={6}>6 hours</option>
-                                <option value={12}>12 hours</option>
-                                <option value={24}>24 hours (1 day)</option>
-                                <option value={48}>48 hours (2 days)</option>
-                                <option value={72}>72 hours (3 days)</option>
-                                <option value={168}>1 week</option>
+                                {FORUM_TIME_LIMITS.map(option => (
+                                    <option key={option.hours} value={option.hours}>{option.label}</option>
+                                ))}
                             </select>
                             <p className="mt-1 text-sm text-gray-500 ">
                                 The forum will automatically close after this time period

@@ -1,12 +1,12 @@
 import { onAuthStateChanged, type User } from "firebase/auth";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import { Footer } from "../components/footer/footer";
 import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
-import { authorIdentity } from "./author-identity";
+import { newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -18,6 +18,8 @@ export default function ForumDetailPage() {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [showTeaModal, setShowTeaModal] = useState(false);
     const [user, setCurrentUser] = useState<any>(null);
+    // One ID per draft: a retried send can't post the same message twice
+    const draftRequestId = useRef<string | null>(null);
 
     // Set up auth state listener once on mount
     useEffect(() => {
@@ -48,20 +50,21 @@ export default function ForumDetailPage() {
         setIsSubmitting(true);
         
         try {
-            const anonymousPreference =
-                typeof window !== "undefined" ? window.sessionStorage.getItem("anonymous") : null;
-            const author = authorIdentity(user, anonymousPreference);
+            draftRequestId.current ??= newRequestId();
+            // The server checks the message, sets the author from the signed-in
+            // account and saves it with the forum's comment count
             await createComment({
                 forumId: forumId,
-                userId: author.id,
-                userName: author.name,
                 content: newMessage.trim(),
+                anonymous: prefersAnonymous(),
+                requestId: draftRequestId.current,
             });
-            
+
             setNewMessage("");
+            draftRequestId.current = null;
         } catch (error) {
-            console.error("Failed to post message:", error);
-            alert("Failed to post message. Please try again.");
+            // The draft stays in the box so it can be revised and resent
+            alert(publishErrorMessage(error, "Failed to post message. Please try again."));
         } finally {
             setIsSubmitting(false);
         }
