@@ -7,22 +7,7 @@ import { createHash } from "crypto";
 import { doc, getDoc, updateDoc } from "firebase/firestore";
 import OpenAI from "openai";
 import { db } from "../firebase/config.js";
-
-interface MessageAnalysisRequest {
-  forumId: string;
-  threadId?: string;
-  forumTitle: string;
-  forumDescription?: string;
-  forumQuestion?: string;
-  category?: string;
-  messages: Array<{
-    id: number;
-    author: string;
-    content: string;
-    timestamp: string;
-    threadId?: string;
-  }>;
-}
+import { readAnalysisRequest } from "./analyze-request";
 
 interface MessageAnalysisResponse {
   totalMessages: number;
@@ -39,8 +24,17 @@ export async function action({ request }: { request: Request }): Promise<Respons
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 
+  // Phase 2A (transitional): input is validated, but the Authorization header
+  // is not checked yet. Phase 2B adds requireUser(request) here.
+  const parsed = await readAnalysisRequest(request);
+  if (!parsed.ok) {
+    console.warn("[analyzeMessages] Rejected request:", parsed.reason);
+    const error = parsed.status === 413 ? "Request too large" : "Invalid request";
+    return Response.json({ error, reason: parsed.reason }, { status: parsed.status });
+  }
+
   try {
-    const body: MessageAnalysisRequest = await request.json();
+    const body = parsed.value;
     console.log("[analyzeMessages] Request received:", { forumId: body?.forumId, messagesLength: body?.messages?.length });
     
     if (!OPENAI_API_KEY) {
