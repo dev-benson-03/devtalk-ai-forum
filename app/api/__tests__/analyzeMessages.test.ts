@@ -10,6 +10,7 @@ const SECRET_TOKEN = "eyJhbGciOiJSUzI1NiJ9.SECRET-PAYLOAD.SECRET-SIGNATURE";
 const FORUM_ID = "forum1";
 const PRIVATE_TEXT = "my private comment text";
 const RAW_MODEL_TEXT = "RAW-MODEL-OUTPUT";
+const VALID_REPLY = `{"summary":"Test summary","actionRoadmap":["Step 1","Step 2","Step 3"]}`;
 
 // ---- OpenAI mock -----------------------------------------------------------
 const mockCreate = jest.fn();
@@ -109,7 +110,7 @@ describe("analyzeMessages action", () => {
     mockCache = {};
     mockForumGetError = null;
     signedIn("viewer-uid");
-    modelReplies(`{"summary":"Test summary","actionRoadmap":["Step 1","Step 2","Step 3"]}`);
+    modelReplies(VALID_REPLY);
     logs = (["log", "info", "warn", "error"] as const).map((level) =>
       jest.spyOn(console, level).mockImplementation(() => {})
     );
@@ -275,18 +276,23 @@ describe("analyzeMessages action", () => {
     expect(fields.analysisSummary).toBe("Test summary");
   });
 
-  it("drops extra keys and non-string steps from the model output before saving", async () => {
-    modelReplies(`{"summary":"S","actionRoadmap":["A",{"x":1},"B"],"isAdminDeleted":true}`);
+  it("drops extra keys from the model output before saving", async () => {
+    modelReplies(`{"summary":"Test summary","actionRoadmap":["Step 1","Step 2","Step 3"],"isAdminDeleted":true}`);
     const { body } = await call(post({ forumId: FORUM_ID }));
-    expect(body.actionRoadmap).toEqual(["A", "B"]);
+    expect(body.actionRoadmap).toEqual(["Step 1", "Step 2", "Step 3"]);
     expect(mockUpdate.mock.calls[0][2]).not.toHaveProperty("isAdminDeleted");
   });
 
-  it("returns the fallback analysis but does not save it when the model output is unusable", async () => {
-    modelReplies(`not json ${RAW_MODEL_TEXT}`);
+  it.each([
+    ["not JSON", `not json ${RAW_MODEL_TEXT}`],
+    ["a partial roadmap", `{"summary":"${RAW_MODEL_TEXT} summary","actionRoadmap":["Step 1","Step 2"]}`],
+    ["a non-string step", `{"summary":"${RAW_MODEL_TEXT} summary","actionRoadmap":["Step 1",{"x":1},"Step 3"]}`],
+    ["an empty summary", `{"summary":"  ","actionRoadmap":["Step 1","Step 2","Step 3"]}`],
+  ])("returns a retryable 502 and saves nothing for %s", async (_label, content) => {
+    modelReplies(content);
     const { status, body } = await call(post({ forumId: FORUM_ID }));
-    expect(status).toBe(200);
-    expect(body.actionRoadmap).toHaveLength(3);
+    expect(status).toBe(502);
+    expect(body).toEqual({ error: "Analysis unavailable", reason: "invalid_model_output" });
     expect(mockUpdate).not.toHaveBeenCalled();
     expect(loggedText()).not.toContain(RAW_MODEL_TEXT);
   });
@@ -329,7 +335,7 @@ describe("analyzeMessages action", () => {
 
   // ---- Logging -------------------------------------------------------------
   it("logs structured diagnostics without tokens, comment text or model output", async () => {
-    modelReplies(`{"summary":"${RAW_MODEL_TEXT}","actionRoadmap":["1"]}`);
+    modelReplies(`{"summary":"${RAW_MODEL_TEXT} text","actionRoadmap":["Step 1","Step 2","Step 3"]}`);
     await call(post({ forumId: FORUM_ID }));
     const text = loggedText();
     expect(text).toContain('"event":"analysis_complete"');

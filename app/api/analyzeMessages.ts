@@ -14,6 +14,7 @@ import { requireUser, type AuthenticatedUser } from "../auth/authenticate.server
 import { canForceRegenerate, canViewForum } from "../auth/forum-access";
 import { getAdminDb } from "../firebase/admin.server";
 import { countUniqueAuthors, selectForAnalysis, toTrustedComment, type TrustedComment } from "./analysis-comments";
+import { parseModelAnalysis } from "./analysis-output";
 import { readAnalysisRequest } from "./analyze-request";
 
 interface MessageAnalysisResponse {
@@ -78,37 +79,6 @@ function buildThreadSummaries(comments: TrustedComment[]): string[] {
 }
 
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
-
-/** Parses the model output; returns null when it lacks the expected keys. */
-function parseAnalysis(aiResponse: string): { summary: string; actionRoadmap: string[] } | null {
-  // Remove markdown code fences, then take the first {...} or [...] block
-  const cleaned = aiResponse.replace(/```json|```/g, "").trim();
-  const match = cleaned.match(/(\{[\s\S]*?\}|\[[\s\S]*?\])/);
-  let parsed: any = null;
-  if (match) {
-    try {
-      parsed = JSON.parse(match[0]);
-    } catch {
-      try { parsed = JSON.parse(cleaned); } catch { parsed = null; }
-    }
-  }
-  if (parsed && typeof parsed.summary === "string" && Array.isArray(parsed.actionRoadmap)) {
-    return {
-      summary: parsed.summary,
-      actionRoadmap: parsed.actionRoadmap.filter((step: unknown) => typeof step === "string"),
-    };
-  }
-  return null;
-}
-
-const FALLBACK_ANALYSIS = {
-  summary: "Messages show active discussion about tech topics with mixed engagement levels.",
-  actionRoadmap: [
-    "1️⃣ Start by identifying key themes",
-    "2️⃣ Build on popular topics",
-    "3️⃣ Finish with actionable insights",
-  ],
-};
 
 export async function action({ request }: { request: Request }): Promise<Response> {
   const started = Date.now();
@@ -243,34 +213,32 @@ Return JSON: {"summary": "...", "actionRoadmap": ["1️⃣ ...", "2️⃣ ...", 
     temperature: 0.3,
   });
 
-  const aiResponse = completion.choices[0]?.message?.content || "{}";
-  const analysis = parseAnalysis(aiResponse);
-  log(analysis ? "info" : "warn", analysis ? "openai_parsed" : "openai_parse_failed", {
+  const aiResponse = completion.choices[0]?.message?.content || "";
+  const analysis = parseModelAnalysis(aiResponse);
+  log(analysis ? "info" : "warn", analysis ? "openai_parsed" : "openai_invalid_output", {
     forumId,
     responseLength: aiResponse.length,
     elapsedMs: elapsedMs(),
   });
-  const result = analysis ?? FALLBACK_ANALYSIS;
+  // Invalid output is never saved or replaced with made-up text; the client may retry
+  if (!analysis) return json({ error: "Analysis unavailable", reason: "invalid_model_output" }, 502);
 
-  // Persist only real analysis, and only the approved fields
-  if (analysis) {
-    try {
-      await db.collection("forums").doc(forumId).update({
-        analysisSummary: analysis.summary,
-        actionRoadmap: analysis.actionRoadmap,
-        lastAnalyzedAt: new Date().toISOString(),
-      });
-      log("info", "forum_updated", { forumId });
-    } catch (updateError) {
-      log("error", "forum_update_failed", { forumId, code: safeErrorCode(updateError) });
-    }
+  try {
+    await db.collection("forums").doc(forumId).update({
+      analysisSummary: analysis.summary,
+      actionRoadmap: analysis.actionRoadmap,
+      lastAnalyzedAt: new Date().toISOString(),
+    });
+    log("info", "forum_updated", { forumId });
+  } catch (updateError) {
+    log("error", "forum_update_failed", { forumId, code: safeErrorCode(updateError) });
   }
 
   const response: MessageAnalysisResponse = {
     totalMessages,
     uniqueAuthors,
-    summary: result.summary,
-    actionRoadmap: result.actionRoadmap,
+    summary: analysis.summary,
+    actionRoadmap: analysis.actionRoadmap,
   };
   log("info", "analysis_complete", { forumId, status: 200, totalMessages, uniqueAuthors, elapsedMs: elapsedMs() });
   return json(response);
