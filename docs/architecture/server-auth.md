@@ -165,7 +165,7 @@ replaced with `unknown` unless it matches `^(auth|app|admin)/[a-z0-9-]+$`.
 reports `auth/argument-error`, the same code as a bad token, so that outage
 returns 401 rather than 503. Telling them apart would mean parsing messages.
 
-## Plan for `app/api/analyzeMessages.ts` (not changed in this phase)
+## Plan for `app/api/analyzeMessages.ts`
 
 **Verified** current behavior:
 
@@ -183,6 +183,49 @@ returns 401 rather than 503. Telling them apart would mean parsing messages.
   (`app/message/services/AnalysisService.ts`), only reached from
   `app/forum/forum-detail.tsx`, which already redirects signed-out users to
   `/login`. `MessageList.analyzeMessages` is defined but never invoked.
+
+## Phase 2A status: transitional, not yet secure
+
+Steps 1 and 2 below are done. **The endpoint still accepts unauthenticated
+requests**; anyone can call it until Phase 2B adds `requireUser(request)`.
+
+**Request flow (Verified):** `forum-detail.tsx` (redirects signed-out users to
+`/login`) → "What's Tea" button → `TeaModal` reads the forum's `comments` with
+the client SDK → `AnalysisService.analyzeMessages` → `POST /api/analyzeMessages`.
+TeaModal sends `{ forumId, forumTitle, forumDescription?, forumQuestion?,
+category?, messages: [{ id, content, userName, createdAt, forumId }] }`; the
+server's old type expected `{ id: number, author, content, timestamp }`, so
+`uniqueAuthors` is always 1 for TeaModal requests (unchanged here). Response:
+`{ totalMessages, uniqueAuthors, summary, actionRoadmap }`. `MessageList`
+also defines a call to the endpoint but never invokes it.
+
+**Client (`AnalysisService`):** waits for `firebaseAuth.authStateReady()`, takes
+`currentUser`, sends `Authorization: Bearer <getIdToken()>`. A 401 is retried
+once with `getIdToken(true)`. Failures throw `AnalysisAuthError` with reason
+`signed_out`, `token_unavailable` or `unauthorized` (no token inside);
+`TeaModal` shows "Please sign in again to spill the tea" for these and keeps
+its existing message for other errors.
+
+**Server validation (`app/api/analyze-request.ts`)**, before any Firestore or
+OpenAI call. Failures return `{ error: "Invalid request", reason }` with 400,
+or `{ error: "Request too large", reason: "body_too_large" }` with 413.
+
+| Rule | Limit / format | Why |
+| --- | --- | --- |
+| Body size | 512 KiB (Content-Length checked first, then actual bytes) | Fits 200k chars of mostly-ASCII content plus normal metadata; an outer cap even if every field is near its own limit. Vercel allows 4.5 MB |
+| JSON | must parse to a plain object | |
+| `forumId` | required, `^[A-Za-z0-9_-]{1,128}$`, not `__x__` | Firestore auto-IDs are 20 alphanumerics; blocks paths like `a/b` |
+| `forumTitle`, `forumDescription`, `forumQuestion`, `category` | optional strings, ≤ 2,000 chars | |
+| `messages` | array of 1–500 | the 43 migrated docs span all forums; ample headroom |
+| message `id` | doc-ID string or non-negative integer | TeaModal sends doc IDs, older callers numbers |
+| message `content` | required string, ≤ 10,000 chars | |
+| total `content` | ≤ 200,000 chars (~50k tokens) | bounds OpenAI prompt size and cost |
+| `author`, `userName`, `timestamp`, `threadId`, `forumId` | optional strings, ≤ 2,000 chars | |
+| `createdAt` | optional: string, `null`, or `{ seconds, nanoseconds, type? }` | how a Firestore Timestamp serializes |
+
+Only these fields are copied forward; anything else (for example `uid`,
+`userId`) is dropped, so client-supplied user IDs can never drive
+authorization.
 
 **Proposed** migration, one small PR each, in order:
 

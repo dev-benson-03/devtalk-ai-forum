@@ -7,7 +7,7 @@ import { collection, getDocs, query, where } from 'firebase/firestore';
 import { useEffect, useState } from 'react';
 import { db } from '../../firebase/config';
 import type { Message } from '../models/Message';
-import { AnalysisService, type MessageAnalysisResponse } from '../services/AnalysisService';
+import { AnalysisAuthError, AnalysisService, type MessageAnalysisResponse } from '../services/AnalysisService';
 
 interface TeaModalProps {
   onClose: () => void;
@@ -24,6 +24,7 @@ export default function TeaModal({ onClose, forumId, forumTitle, forumDescriptio
   const [analysis, setAnalysis] = useState<MessageAnalysisResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [needsSignIn, setNeedsSignIn] = useState(false);
 
   useEffect(() => {
     const fetchMessages = async () => {
@@ -72,7 +73,13 @@ export default function TeaModal({ onClose, forumId, forumTitle, forumDescriptio
         });
         setAnalysis(result);
       } catch (error) {
-        console.error('Analysis failed:', error);
+        if (error instanceof AnalysisAuthError) {
+          // Log the reason only; the error never carries a token
+          console.warn('[TeaModal] Analysis needs sign-in:', error.reason);
+          setNeedsSignIn(true);
+        } else {
+          console.error('Analysis failed:', error);
+        }
       } finally {
         setLoading(false);
       }
@@ -132,6 +139,8 @@ export default function TeaModal({ onClose, forumId, forumTitle, forumDescriptio
                 </div>
               </div>
             </div>
+          ) : needsSignIn ? (
+            <p className="text-red-600">Please sign in again to spill the tea 🫖</p>
           ) : (
             <p className="text-red-600">Unable to spill the tea right now 🫖</p>
           )}
