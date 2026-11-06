@@ -17,6 +17,8 @@ export class FakeFirestore {
   writes: FakeWrite[] = [];
   /** Collections whose reads and writes throw this error. */
   failures = new Map<string, unknown>();
+  /** Collections whose writes (only) throw this error. */
+  writeFailures = new Map<string, unknown>();
   private queue: Promise<unknown> = Promise.resolve();
 
   seed(collection: string, id: string, data: Data) {
@@ -41,11 +43,19 @@ export class FakeFirestore {
     return { id, exists: data !== undefined, data: () => data };
   }
 
-  private write(op: FakeWrite["op"], collection: string, id: string, data: Data, merge = false) {
+  /** Throws if this write would fail, without applying it. */
+  private checkWrite(op: FakeWrite["op"], collection: string, id: string) {
     this.check(collection);
+    if (this.writeFailures.has(collection)) throw this.writeFailures.get(collection);
+    if (op === "update" && !this.docs.has(`${collection}/${id}`)) {
+      throw Object.assign(new Error("NOT_FOUND"), { code: 5 });
+    }
+  }
+
+  private write(op: FakeWrite["op"], collection: string, id: string, data: Data, merge = false) {
+    this.checkWrite(op, collection, id);
     const path = `${collection}/${id}`;
     const existing = this.docs.get(path);
-    if (op === "update" && !existing) throw Object.assign(new Error("NOT_FOUND"), { code: 5 });
     this.docs.set(path, op === "update" || merge ? { ...existing, ...data } : { ...data });
     this.writes.push({ op, collection, id, data });
   }
@@ -74,22 +84,26 @@ export class FakeFirestore {
     };
   }
 
-  /** Runs transactions one at a time; buffered writes apply only if fn succeeds. */
+  /**
+   * Runs transactions one at a time. Writes are buffered and applied only if
+   * fn succeeds and every write can succeed: all or nothing, like Firestore.
+   */
   runTransaction<T>(fn: (tx: FakeTransaction) => Promise<T>): Promise<T> {
     const run = this.queue.then(async () => {
-      const pending: Array<() => void> = [];
       type Ref = { __collection: string; id: string };
+      const pending: Array<{ op: FakeWrite["op"]; ref: Ref; data: Data; merge?: boolean }> = [];
       const tx: FakeTransaction = {
         get: async (ref: Ref) => this.snapshot(ref.__collection, ref.id),
         set: (ref: Ref, data: Data, options?: { merge?: boolean }) => {
-          pending.push(() => this.write("set", ref.__collection, ref.id, data, options?.merge));
+          pending.push({ op: "set", ref, data, merge: options?.merge });
         },
         update: (ref: Ref, data: Data) => {
-          pending.push(() => this.write("update", ref.__collection, ref.id, data));
+          pending.push({ op: "update", ref, data });
         },
       };
       const result = await fn(tx);
-      pending.forEach((apply) => apply());
+      pending.forEach((w) => this.checkWrite(w.op, w.ref.__collection, w.ref.id));
+      pending.forEach((w) => this.write(w.op, w.ref.__collection, w.ref.id, w.data, w.merge));
       return result;
     });
     this.queue = run.catch(() => undefined);
