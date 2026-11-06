@@ -169,7 +169,9 @@ returns 401 rather than 503. Telling them apart would mean parsing messages.
 
 Steps 1–5 and 7 of the original migration plan are done (Phase 2A sent the
 token and validated input; Phase 2B enforces auth and uses trusted data).
-Writing `analysisCache` (step 6) and rate limiting are still open.
+Phase 2C added caching, rate limits, a generation lock and strict output
+validation; see [ai-analysis.md](./ai-analysis.md), which replaces steps 8–10
+and the cost risk below.
 
 ### Firestore fields used (Verified from the code that writes them)
 
@@ -182,7 +184,7 @@ Writing `analysisCache` (step 6) and rate limiting are still open.
 | Comment author | `comments.userId` (UID, or `"anonymous"` when signed out), `comments.userName` (display name or `"Anonymous User"`) | `forum/forum-detail.tsx` |
 | Comment → forum | `comments.forumId` | `forum-detail.tsx` |
 | Thread | `comments.parentId` (declared in `useFirestore.ts`; nothing writes it yet, so all comments are thread `"main"`, as before) | — |
-| Analysis | `forums.analysisSummary`, `forums.actionRoadmap`, `forums.lastAnalyzedAt`; cache `analysisCache/{analysis_<forumId>_<md5>}` (read only; nothing writes it) | this route |
+| Analysis | `forums.analysisSummary`, `forums.actionRoadmap`, `forums.lastAnalyzedAt`; cache `analysisCache/{<forumId>_<sha256>}` (Phase 2C) | this route |
 | Admin | none on the server. The app's only admin check is a hardcoded UID in the browser (`account/login.tsx`), which the server ignores | — |
 
 ### Request flow
@@ -226,12 +228,9 @@ status, totalMessages, analyzedMessages, threads, responseLength, elapsedMs,
 code }`. Client: `[TeaModal] analysis { forumId, outcome, elapsedMs }`. No
 tokens, comment text, forum conversations, model output, UIDs or keys.
 
-### Remaining risks (for Phase 2C and later)
+### Remaining risks (Phase 2B; see ai-analysis.md for the Phase 2C update)
 
-- **Cost abuse:** any signed-in user can trigger a full OpenAI call per
-  request; nothing writes `analysisCache` and there is no rate limit. A loop
-  with a valid token can run up OpenAI cost and Firestore reads (≤ 2,000
-  comment docs per call).
+- ~~**Cost abuse**~~: addressed in Phase 2C (cache, quotas, lock).
 - **Any signed-in user can overwrite a forum's saved analysis fields** by
   requesting analysis (intended: viewers may analyze), but the saved value
   always comes from the server's own OpenAI call.
