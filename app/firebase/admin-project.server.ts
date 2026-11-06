@@ -28,3 +28,43 @@ export function readAdminProjectId(env: Partial<Record<string, string | undefine
   }
   return projectId;
 }
+
+/** Rejects a service account that belongs to a different project. */
+export function assertServiceAccountProject(clientEmail: string, projectId: string): void {
+  if (!clientEmail.toLowerCase().endsWith(`@${projectId}.iam.gserviceaccount.com`)) {
+    throw new AdminConfigError("The Admin service account does not belong to the configured project.");
+  }
+}
+
+const ADC_PROJECT_ENVS = ["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"] as const;
+
+/**
+ * Rejects ADC settings that point at another project: the Google Cloud
+ * project env vars, or a service-account key file named by
+ * GOOGLE_APPLICATION_CREDENTIALS. Gcloud user logins and federated
+ * (external_account) files carry no project and are allowed.
+ */
+export function assertAdcProject(
+  env: Partial<Record<string, string | undefined>>,
+  projectId: string,
+  readFile: (path: string) => string
+): void {
+  for (const name of ADC_PROJECT_ENVS) {
+    const value = env[name]?.trim();
+    if (value && value !== projectId) {
+      throw new AdminConfigError(`${name} does not match ${ADMIN_PROJECT_ENV}.`);
+    }
+  }
+
+  const keyFile = env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  if (!keyFile) return;
+  let fileProject: unknown;
+  try {
+    fileProject = JSON.parse(readFile(keyFile)).project_id;
+  } catch {
+    throw new AdminConfigError("GOOGLE_APPLICATION_CREDENTIALS could not be read as JSON.");
+  }
+  if (fileProject !== undefined && fileProject !== projectId) {
+    throw new AdminConfigError("GOOGLE_APPLICATION_CREDENTIALS belongs to a different project.");
+  }
+}
