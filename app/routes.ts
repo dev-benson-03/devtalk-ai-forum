@@ -9,5 +9,7 @@ export default [
     route("signup","routes/signup.tsx"),
     route("login","routes/login.tsx"),
     route("userdashboard","routes/userdashboard.tsx"),
-    route("api/analyzeMessages", "api/analyzeMessages.ts")
+    route("api/analyzeMessages", "api/analyzeMessages.ts"),
+    route("api/forums", "api/createForum.ts"),
+    route("api/comments", "api/createComment.ts")
 ] satisfies RouteConfig;
