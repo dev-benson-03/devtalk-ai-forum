@@ -11,7 +11,6 @@
  */
 
 import OpenAI from "openai";
-import type { Firestore } from "firebase-admin/firestore";
 import { requireUser, type AuthenticatedUser } from "../auth/authenticate.server";
 import { canForceRegenerate, canViewForum } from "../auth/forum-access";
 import { getAdminDb } from "../firebase/admin.server";
@@ -33,6 +32,8 @@ import {
 } from "./analysis-limits.server";
 import { parseModelAnalysis, type AnalysisText } from "./analysis-output";
 import { readAnalysisRequest } from "./analyze-request";
+
+type Firestore = ReturnType<typeof getAdminDb>;
 
 interface MessageAnalysisResponse {
   totalMessages: number;
