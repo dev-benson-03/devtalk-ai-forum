@@ -8,10 +8,12 @@ behavior is unchanged. Labels: **Verified** (checked in code or by running it),
 
 | File | Runs on | Job |
 | --- | --- | --- |
-| `app/firebase/admin-credential.server.ts` | server | Builds Admin SDK options from env: service-account fields if set, else Application Default Credentials (ADC). Errors name missing variables only. |
-| `app/firebase/admin.server.ts` | server | One named Admin app (`devtalk-admin`), created on first use and reused. Exposes `getAdminAuth()` and `getAdminDb()`. |
+| `app/firebase/admin-project.server.ts` | server | Project isolation checks (validation only): allow-listed `FIREBASE_ADMIN_PROJECT_ID`, service-account and ADC project checks. Throws `AdminConfigError`. |
+| `app/firebase/admin-credential.server.ts` | server | Builds Admin SDK options from env, always pinned to the validated project: service-account fields if set, else Application Default Credentials (ADC). |
+| `app/firebase/admin.server.ts` | server | One named Admin app (`devtalk-admin`), created on first use and reused; a cached app for another project is refused. Exposes `getAdminAuth()` and `getAdminDb()`. |
 | `app/auth/bearer-token.ts` | either | Parses `Authorization: Bearer <token>`. |
-| `app/auth/authenticate.server.ts` | server | `requireUser(request)`: verifies the ID token (with revocation check) and returns `{ uid, token }`, or throws a 401 `Response`. |
+| `app/auth/authenticate.server.ts` | server | `requireUser(request)`: verifies the ID token (with revocation check) and returns `{ uid, token }`, or throws a sanitized 401, 503 or 500 `Response`. |
+| `app/auth/classify-auth-error.ts` | either | Maps documented firebase-admin error codes to 401 / 503 / 500. |
 | `app/auth/authorize.ts` | either | Authorization, kept separate: `requireOwner(user, ownerUid)` throws a 403 `Response`. |
 | `app/auth/responses.ts` | either | Small JSON error `Response` helper. |
 
@@ -115,12 +117,53 @@ Vercel has no ADC, so the server needs a credential from env. Two options:
 
 | Name | Needed when | Notes |
 | --- | --- | --- |
-| `FIREBASE_ADMIN_PROJECT_ID` | Always recommended; required with a key | `devtalk-88046` |
+| `FIREBASE_ADMIN_PROJECT_ID` | Always (required) | Must be `devtalk-88046` |
 | `FIREBASE_ADMIN_CLIENT_EMAIL` | Vercel (option 1) | Service-account email |
 | `FIREBASE_ADMIN_PRIVATE_KEY` | Vercel (option 1) | PEM key; literal `\n` is converted to newlines |
 
 If only some of the key fields are set, the server throws an error that names
 the missing variables (never values).
+
+## Project isolation (Phase 1.1)
+
+- `FIREBASE_ADMIN_PROJECT_ID` is required, trimmed, and must be in
+  `ALLOWED_ADMIN_PROJECT_IDS` (`devtalk-88046` only). `codesocietycapstone`
+  and any other value are rejected.
+- The validated ID is always passed to `initializeApp`, so Auth (token
+  audience) and Firestore target it rather than whatever ADC would infer.
+- Service-account mode: `FIREBASE_ADMIN_CLIENT_EMAIL` must end in
+  `@devtalk-88046.iam.gserviceaccount.com`.
+- ADC mode: `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT`, if set, must match, and a
+  key file named by `GOOGLE_APPLICATION_CREDENTIALS` must not carry another
+  `project_id`. Gcloud user logins and federated (`external_account`) files
+  have no project and are allowed, which keeps local ADC and future Vercel
+  OIDC working.
+- A cached Admin app whose project differs from the current config is refused.
+- All failures are `AdminConfigError` (`admin/invalid-config`) with messages
+  that name variables, never values. `requireUser` turns them into a 500.
+
+## Authentication error classification (Phase 1.1)
+
+| Condition | Firebase code(s) | HTTP |
+| --- | --- | --- |
+| Missing or malformed `Authorization` header | (none; checked before Firebase) | 401 |
+| Invalid / malformed token, bad signature, wrong project audience | `auth/argument-error`, `auth/invalid-id-token` | 401 |
+| Expired token | `auth/id-token-expired` | 401 |
+| Revoked token | `auth/id-token-revoked` | 401 |
+| Disabled or deleted account | `auth/user-disabled`, `auth/user-not-found` | 401 |
+| User lacks permission | `requireOwner` in `authorize.ts` | 403 |
+| Firebase unavailable or throttled | `auth/internal-error`, `auth/quota-exceeded`, `app/network-error`, `app/network-timeout` | 503 + `Retry-After` |
+| Server credential or configuration failure | `admin/invalid-config`, `auth/invalid-credential`, `app/invalid-credential`, `auth/insufficient-permission`, `auth/project-not-found` | 500 |
+| Anything else, including unknown `auth/*` codes | | 500 |
+
+Codes come from `AuthErrorCode` and `AppErrorCode` in firebase-admin 14.5.0.
+Response bodies are fixed strings. Logs are one structured object,
+`{ event: "auth.verify_failed", status, category, code }`, where `code` is
+replaced with `unknown` unless it matches `^(auth|app|admin)/[a-z0-9-]+$`.
+
+**Known limit:** if Google's public signing keys can't be fetched, the SDK
+reports `auth/argument-error`, the same code as a bad token, so that outage
+returns 401 rather than 503. Telling them apart would mean parsing messages.
 
 ## Plan for `app/api/analyzeMessages.ts` (not changed in this phase)
 
