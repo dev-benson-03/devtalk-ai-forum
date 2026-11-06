@@ -1,6 +1,6 @@
 import type { User } from 'firebase/auth';
 import type { MessageAnalysisResponse } from './AnalysisService';
-import { AnalysisAuthError, AnalysisService } from './AnalysisService';
+import { AnalysisAuthError, AnalysisService, IN_PROGRESS_RETRIES } from './AnalysisService';
 
 const SECRET_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.SECRET-PAYLOAD.SECRET-SIGNATURE';
 const FRESH_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.FRESH-PAYLOAD.FRESH-SIGNATURE';
@@ -15,10 +15,12 @@ const mockResponse: MessageAnalysisResponse = {
 };
 
 const fakeUser = (getIdToken: jest.Mock) => ({ getIdToken }) as unknown as User;
-const serviceFor = (user: User | null) => new AnalysisService(async () => user);
-const reply = (status: number, body: unknown = {}) => ({
+const mockWait = jest.fn(async (_ms: number) => {});
+const serviceFor = (user: User | null) => new AnalysisService(async () => user, mockWait);
+const reply = (status: number, body: unknown = {}, headers: Record<string, string> = {}) => ({
   ok: status >= 200 && status < 300,
   status,
+  headers: { get: (name: string) => headers[name] ?? null },
   json: async () => body,
 });
 const authHeaderOf = (call: number) =>
@@ -29,6 +31,7 @@ describe('AnalysisService', () => {
   let logs: jest.SpyInstance[];
 
   beforeEach(() => {
+    mockWait.mockClear();
     global.fetch = jest.fn();
     getIdToken = jest.fn(async (force?: boolean) => (force ? FRESH_TOKEN : SECRET_TOKEN));
     logs = (['log', 'warn', 'error', 'info', 'debug'] as const).map((level) =>
@@ -111,6 +114,33 @@ describe('AnalysisService', () => {
       forumId: 'f1',
       forceRegenerate: true,
     });
+  });
+
+  it('waits for Retry-After and asks again while the analysis is in progress', async () => {
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce(reply(409, { reason: 'in_progress' }, { 'Retry-After': '3' }))
+      .mockResolvedValueOnce(reply(200, mockResponse));
+    const result = await serviceFor(fakeUser(getIdToken)).analyzeMessages(payload);
+    expect(mockWait).toHaveBeenCalledWith(3000);
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(result).toEqual(mockResponse);
+  });
+
+  it('caps the wait and gives up after a few in-progress replies', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(reply(409, {}, { 'Retry-After': '120' }));
+    const error = await serviceFor(fakeUser(getIdToken)).analyzeMessages(payload).catch((e) => e);
+    expect(error.status).toBe(409);
+    expect(global.fetch).toHaveBeenCalledTimes(1 + IN_PROGRESS_RETRIES);
+    expect(mockWait).toHaveBeenCalledWith(10_000);
+  });
+
+  it('does not retry a 429 rate limit', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(reply(429, { reason: 'user_requests' }, { 'Retry-After': '600' }));
+    const error = await serviceFor(fakeUser(getIdToken)).analyzeMessages(payload).catch((e) => e);
+    expect(error.message).toBe('Failed to analyze messages');
+    expect(error.status).toBe(429);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(mockWait).not.toHaveBeenCalled();
   });
 
   it('error messages never contain a token', () => {

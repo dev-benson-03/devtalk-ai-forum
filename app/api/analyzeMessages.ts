@@ -3,18 +3,42 @@
  * POST handler that analyzes a forum's comments using the OpenAI API.
  *
  * Flow: authenticate (Firebase ID token) → validate { forumId, forceRegenerate }
- * → load the forum and its comments with the Admin SDK → authorize → cache
- * read → OpenAI → persist approved analysis fields. Nothing from the client
- * except forumId and forceRegenerate is used.
+ * → per-user request limit → load the forum and its comments with the Admin
+ * SDK → authorize → cache read → generation gate (lock, cooldown, quotas) →
+ * OpenAI → strict validation → one transaction that, only if this request
+ * still holds the lock, writes the cache entry, the approved forum fields and
+ * the cooldown. Nothing from the client except forumId and forceRegenerate
+ * is used.
+ * See docs/architecture/ai-analysis.md.
  */
 
-import { createHash } from "crypto";
 import OpenAI from "openai";
 import { requireUser, type AuthenticatedUser } from "../auth/authenticate.server";
 import { canForceRegenerate, canViewForum } from "../auth/forum-access";
 import { getAdminDb } from "../firebase/admin.server";
+import {
+  ANALYSIS_MODEL,
+  ANALYSIS_TEMPERATURE,
+  analysisCacheKey,
+  cacheEntry,
+  cacheRef,
+  readCachedAnalysis,
+  type AnalysisCounts,
+  type ForumContext,
+} from "./analysis-cache.server";
 import { countUniqueAuthors, selectForAnalysis, toTrustedComment, type TrustedComment } from "./analysis-comments";
+import {
+  ANALYSIS_QUOTAS,
+  LimitStoreError,
+  acquireGeneration,
+  consumeUserRequest,
+  publishGeneration,
+  releaseGeneration,
+} from "./analysis-limits.server";
+import { parseModelAnalysis, type AnalysisText } from "./analysis-output";
 import { readAnalysisRequest } from "./analyze-request";
+
+type Firestore = ReturnType<typeof getAdminDb>;
 
 interface MessageAnalysisResponse {
   totalMessages: number;
@@ -25,12 +49,15 @@ interface MessageAnalysisResponse {
 
 // OpenAI client setup
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+/** Bounded so a call always ends well inside the generation lock's TTL (2 min). */
+const OPENAI_TIMEOUT_MS = 30_000;
+const OPENAI_MAX_RETRIES = 1;
 
 /** Upper bound on comment docs read for one forum (Firestore read cost). */
 const MAX_COMMENT_READS = 2_000;
 
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
 
 /** Structured diagnostics: ids, counts, statuses and safe codes only. */
 function log(level: "info" | "warn" | "error", event: string, fields: Record<string, unknown>) {
@@ -51,6 +78,21 @@ function dataErrorResponse(error: unknown): Response {
   return typeof code === "number" && TRANSIENT_FIRESTORE_CODES.has(code)
     ? json({ error: "Service unavailable" }, 503)
     : json({ error: "Internal server error" }, 500);
+}
+
+const retryAfterSeconds = (ms: number) => Math.max(1, Math.ceil(ms / 1000));
+
+/** 429 / 409 with a Retry-After header (seconds). */
+function retryLater(status: 409 | 429, error: string, reason: string, retryAfterMs: number): Response {
+  const seconds = retryAfterSeconds(retryAfterMs);
+  return json({ error, reason, retryAfterSeconds: seconds }, status, { "Retry-After": String(seconds) });
+}
+
+/** Rate-limit storage is down: refuse rather than generate without limits. */
+function limitsUnavailable(forumId: string | null, error: unknown): Response {
+  const cause = error instanceof LimitStoreError ? error.cause : error;
+  log("error", "rate_limit_unavailable", { forumId, status: 503, code: safeErrorCode(cause) });
+  return json({ error: "Service unavailable", reason: "rate_limit_unavailable" }, 503, { "Retry-After": "30" });
 }
 
 async function authenticate(request: Request): Promise<AuthenticatedUser | Response> {
@@ -79,36 +121,29 @@ function buildThreadSummaries(comments: TrustedComment[]): string[] {
 
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 
-/** Parses the model output; returns null when it lacks the expected keys. */
-function parseAnalysis(aiResponse: string): { summary: string; actionRoadmap: string[] } | null {
-  // Remove markdown code fences, then take the first {...} or [...] block
-  const cleaned = aiResponse.replace(/```json|```/g, "").trim();
-  const match = cleaned.match(/(\{[\s\S]*?\}|\[[\s\S]*?\])/);
-  let parsed: any = null;
-  if (match) {
-    try {
-      parsed = JSON.parse(match[0]);
-    } catch {
-      try { parsed = JSON.parse(cleaned); } catch { parsed = null; }
-    }
-  }
-  if (parsed && typeof parsed.summary === "string" && Array.isArray(parsed.actionRoadmap)) {
-    return {
-      summary: parsed.summary,
-      actionRoadmap: parsed.actionRoadmap.filter((step: unknown) => typeof step === "string"),
-    };
-  }
-  return null;
-}
+/** Forum context from the trusted forum document. */
+const forumContextOf = (forum: Record<string, unknown>): ForumContext => ({
+  title: text(forum.title),
+  description: text(forum.description),
+  question: text(forum.question),
+  category: Array.isArray(forum.tags) ? text(forum.tags[0]) : "",
+});
 
-const FALLBACK_ANALYSIS = {
-  summary: "Messages show active discussion about tech topics with mixed engagement levels.",
-  actionRoadmap: [
-    "1️⃣ Start by identifying key themes",
-    "2️⃣ Build on popular topics",
-    "3️⃣ Finish with actionable insights",
-  ],
-};
+function buildPrompt(ctx: ForumContext, threadSummaries: string[]): string {
+  const forumContext = ctx.title
+    ? `Forum: "${ctx.title}"${ctx.description ? `\nDescription: ${ctx.description}` : ''}${ctx.question ? `\nQuestion: ${ctx.question}` : ''}${ctx.category ? `\nCategory: ${ctx.category}` : ''}\n\n`
+    : '';
+  return `
+${forumContext}Perform hierarchical analysis:
+1. Analyze each thread's diction, tone, structure, and emotional intent
+2. Synthesize into forum-level summary with Gen Z-friendly insights
+3. Create actionable 3-step roadmap
+
+Threads:
+${threadSummaries.join('\n\n')}
+
+Return JSON: {"summary": "...", "actionRoadmap": ["1️⃣ ...", "2️⃣ ...", "3️⃣ ..."]}`;
+}
 
 export async function action({ request }: { request: Request }): Promise<Response> {
   const started = Date.now();
@@ -133,11 +168,23 @@ export async function action({ request }: { request: Request }): Promise<Respons
   }
   const { forumId, forceRegenerate } = parsed.value;
 
-  // 3. Load trusted forum data and authorize
+  // 3. Per-user request limit (verified UID), before any forum or comment reads
+  let db: Firestore;
+  try {
+    db = getAdminDb();
+    const allowed = await consumeUserRequest(db, user.uid);
+    if (!allowed.ok) {
+      log("warn", "rate_limited", { forumId, status: 429, scope: allowed.scope });
+      return retryLater(429, "Too many requests", allowed.scope, allowed.retryAfterMs);
+    }
+  } catch (error) {
+    return limitsUnavailable(forumId, error);
+  }
+
+  // 4. Load trusted forum data and authorize
   let comments: TrustedComment[];
   let forum: Record<string, unknown>;
   try {
-    const db = getAdminDb();
     const forumSnap = await db.collection("forums").doc(forumId).get();
     if (!forumSnap.exists) {
       log("warn", "forum_not_found", { forumId, status: 404 });
@@ -163,115 +210,159 @@ export async function action({ request }: { request: Request }): Promise<Respons
     log("info", "no_comments", { forumId, status: 422 });
     return json({ error: "No comments to analyze", reason: "no_comments" }, 422);
   }
-  if (!OPENAI_API_KEY) {
-    log("error", "openai_not_configured", { forumId, status: 500 });
-    return json({ error: "OpenAI API key not configured" }, 500);
-  }
 
   try {
-    return await analyze(forumId, forum, comments, forceRegenerate, elapsedMs);
+    return await analyze({ db, uid: user.uid, forumId, forum, allComments: comments, forceRegenerate, elapsedMs });
   } catch (error) {
     log("error", "analysis_failed", { forumId, code: safeErrorCode(error), elapsedMs: elapsedMs() });
     return json({ error: "Internal server error" }, 500);
   }
 }
 
-async function analyze(
-  forumId: string,
-  forum: Record<string, unknown>,
-  allComments: TrustedComment[],
-  forceRegenerate: boolean,
-  elapsedMs: () => number
-): Promise<Response> {
-  const db = getAdminDb();
+interface AnalyzeInput {
+  db: Firestore;
+  uid: string;
+  forumId: string;
+  forum: Record<string, unknown>;
+  allComments: TrustedComment[];
+  forceRegenerate: boolean;
+  elapsedMs: () => number;
+}
+
+async function analyze(input: AnalyzeInput): Promise<Response> {
+  const { db, uid, forumId, forum, allComments, forceRegenerate, elapsedMs } = input;
   const comments = selectForAnalysis(allComments);
-  const totalMessages = allComments.length;
-  const uniqueAuthors = countUniqueAuthors(allComments);
+  // Counts always come from the current comments, also when serving a cached analysis
+  const counts: AnalysisCounts = { totalMessages: allComments.length, uniqueAuthors: countUniqueAuthors(allComments) };
+  const context = forumContextOf(forum);
+  const cacheKey = analysisCacheKey(forumId, context, comments);
+  const keyRef = cacheKey.slice(-12); // digest suffix for correlating logs
+  const respond = (analysis: AnalysisText, source: string) => {
+    log("info", "analysis_complete", { forumId, status: 200, source, keyRef, ...counts, elapsedMs: elapsedMs() });
+    const response: MessageAnalysisResponse = { ...counts, ...analysis };
+    return json(response);
+  };
 
-  // Cache key from forum + comment content hash (same formula as before)
-  const messageHash = createHash("md5")
-    .update(JSON.stringify(comments.map((m) => ({ id: m.id, content: m.content }))))
-    .digest("hex");
-  const cacheKey = `analysis_${forumId}_${messageHash}`;
-
+  // 5. Unchanged content: serve the cached analysis (a forced refresh skips this)
   if (!forceRegenerate) {
     try {
-      const cachedDoc = await db.collection("analysisCache").doc(cacheKey).get();
-      if (cachedDoc.exists) {
-        log("info", "cache_hit", { forumId, status: 200, elapsedMs: elapsedMs() });
-        return json(cachedDoc.data() as MessageAnalysisResponse);
-      }
+      const cached = await readCachedAnalysis(db, cacheKey, forumId);
+      if (cached.status === "hit") return respond(cached.analysis, "cache");
+      if (cached.status === "invalid") log("warn", "cache_invalid", { forumId, keyRef });
     } catch (cacheError) {
       log("warn", "cache_check_failed", { forumId, code: safeErrorCode(cacheError) });
     }
   }
 
-  // Forum context from the trusted forum document
-  const forumTitle = text(forum.title);
-  const forumDescription = text(forum.description);
-  const forumQuestion = text(forum.question);
-  const category = Array.isArray(forum.tags) ? text(forum.tags[0]) : "";
-  const forumContext = forumTitle
-    ? `Forum: "${forumTitle}"${forumDescription ? `\nDescription: ${forumDescription}` : ''}${forumQuestion ? `\nQuestion: ${forumQuestion}` : ''}${category ? `\nCategory: ${category}` : ''}\n\n`
-    : '';
-
-  // Generate thread summaries first, then forum-level analysis
-  const threadSummaries = buildThreadSummaries(comments);
-
-  const analysisPrompt = `
-${forumContext}Perform hierarchical analysis:
-1. Analyze each thread's diction, tone, structure, and emotional intent
-2. Synthesize into forum-level summary with Gen Z-friendly insights
-3. Create actionable 3-step roadmap
-
-Threads:
-${threadSummaries.join('\n\n')}
-
-Return JSON: {"summary": "...", "actionRoadmap": ["1️⃣ ...", "2️⃣ ...", "3️⃣ ..."]}`;
-
-  log("info", "openai_request", {
-    forumId,
-    totalMessages,
-    analyzedMessages: comments.length,
-    threads: threadSummaries.length,
-    forceRegenerate,
-  });
-  const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: analysisPrompt }],
-    temperature: 0.3,
-  });
-
-  const aiResponse = completion.choices[0]?.message?.content || "{}";
-  const analysis = parseAnalysis(aiResponse);
-  log(analysis ? "info" : "warn", analysis ? "openai_parsed" : "openai_parse_failed", {
-    forumId,
-    responseLength: aiResponse.length,
-    elapsedMs: elapsedMs(),
-  });
-  const result = analysis ?? FALLBACK_ANALYSIS;
-
-  // Persist only real analysis, and only the approved fields
-  if (analysis) {
-    try {
-      await db.collection("forums").doc(forumId).update({
-        analysisSummary: analysis.summary,
-        actionRoadmap: analysis.actionRoadmap,
-        lastAnalyzedAt: new Date().toISOString(),
-      });
-      log("info", "forum_updated", { forumId });
-    } catch (updateError) {
-      log("error", "forum_update_failed", { forumId, code: safeErrorCode(updateError) });
-    }
+  if (!OPENAI_API_KEY) {
+    log("error", "openai_not_configured", { forumId, status: 500 });
+    return json({ error: "OpenAI API key not configured" }, 500);
   }
 
-  const response: MessageAnalysisResponse = {
-    totalMessages,
-    uniqueAuthors,
-    summary: result.summary,
-    actionRoadmap: result.actionRoadmap,
-  };
-  log("info", "analysis_complete", { forumId, status: 200, totalMessages, uniqueAuthors, elapsedMs: elapsedMs() });
-  return json(response);
+  // 6. Generation gate: one generation per forum at a time, cooldown, quotas
+  let gate;
+  try {
+    gate = await acquireGeneration(db, { forumId, uid, key: cacheKey });
+  } catch (error) {
+    return limitsUnavailable(forumId, error);
+  }
+  if (gate.kind === "in_progress") {
+    log("info", "generation_in_progress", { forumId, status: 409 });
+    return retryLater(409, "Analysis in progress", "in_progress", gate.retryAfterMs);
+  }
+  if (gate.kind === "limited") {
+    log("warn", "rate_limited", { forumId, status: 429, scope: gate.scope });
+    return retryLater(429, "Too many requests", gate.scope, gate.retryAfterMs);
+  }
+  if (gate.kind === "cooldown") {
+    // Content changed during the cooldown: keep showing the latest valid analysis
+    if (!forceRegenerate && gate.previousKey) {
+      try {
+        const previous = await readCachedAnalysis(db, gate.previousKey, forumId);
+        if (previous.status === "hit") return respond(previous.analysis, "previous");
+      } catch (cacheError) {
+        log("warn", "cache_check_failed", { forumId, code: safeErrorCode(cacheError) });
+      }
+    }
+    log("warn", "rate_limited", { forumId, status: 429, scope: "forum_cooldown" });
+    return retryLater(429, "Too many requests", "forum_cooldown", gate.retryAfterMs);
+  }
+  if (gate.recoveredStaleLock) log("warn", "stale_lock_recovered", { forumId });
+
+  // 7. OpenAI, outside any transaction. Unless the results were published
+  //    (which releases the lock atomically), the lock is released afterwards.
+  let releaseLock = true;
+  try {
+    const threadSummaries = buildThreadSummaries(comments);
+    log("info", "openai_request", {
+      forumId,
+      keyRef,
+      totalMessages: counts.totalMessages,
+      analyzedMessages: comments.length,
+      threads: threadSummaries.length,
+      forceRegenerate,
+    });
+    let aiResponse = "";
+    try {
+      const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: OPENAI_TIMEOUT_MS, maxRetries: OPENAI_MAX_RETRIES });
+      const completion = await openai.chat.completions.create({
+        model: ANALYSIS_MODEL,
+        messages: [{ role: "user", content: buildPrompt(context, threadSummaries) }],
+        temperature: ANALYSIS_TEMPERATURE,
+      });
+      aiResponse = completion.choices[0]?.message?.content || "";
+    } catch (openaiError) {
+      log("error", "openai_failed", { forumId, code: safeErrorCode(openaiError), elapsedMs: elapsedMs() });
+      return json({ error: "Analysis unavailable", reason: "upstream_error" }, 502);
+    }
+
+    const analysis = parseModelAnalysis(aiResponse);
+    log(analysis ? "info" : "warn", analysis ? "openai_parsed" : "openai_invalid_output", {
+      forumId,
+      responseLength: aiResponse.length,
+      elapsedMs: elapsedMs(),
+    });
+    // Invalid output is never cached, saved or replaced with made-up text; the client may retry
+    if (!analysis) return json({ error: "Analysis unavailable", reason: "invalid_model_output" }, 502);
+
+    // 8. Publish atomically, only while this request still owns the lock: the
+    //    cache entry, the approved forum fields, the cooldown and the lock release.
+    //    Either all of them are written or none is.
+    let published;
+    try {
+      published = await publishGeneration(db, { forumId, holder: gate.holder, key: cacheKey }, (tx) => {
+        tx.set(cacheRef(db, cacheKey), cacheEntry(forumId, analysis, counts));
+        tx.update(db.collection("forums").doc(forumId), {
+          analysisSummary: analysis.summary,
+          actionRoadmap: analysis.actionRoadmap,
+          lastAnalyzedAt: new Date().toISOString(),
+        });
+      });
+    } catch (persistError) {
+      log("error", "persist_failed", { forumId, code: safeErrorCode(persistError), elapsedMs: elapsedMs() });
+      const transient = TRANSIENT_FIRESTORE_CODES.has((persistError as { code?: unknown } | null)?.code as number);
+      return transient
+        ? json({ error: "Service unavailable", reason: "persist_failed" }, 503, { "Retry-After": "5" })
+        : json({ error: "Internal server error", reason: "persist_failed" }, 500);
+    }
+    if (!published.published) {
+      // The lock expired and another request took over; its result wins. Not ours to release.
+      releaseLock = false;
+      log("warn", "lock_lost", { forumId, keyRef, elapsedMs: elapsedMs() });
+      return retryLater(409, "Analysis in progress", "in_progress", ANALYSIS_QUOTAS.inProgressRetryMs);
+    }
+    releaseLock = false;
+    log("info", "analysis_published", { forumId, keyRef });
+    return respond(analysis, "generated");
+  } finally {
+    if (releaseLock) {
+      try {
+        await releaseGeneration(db, { forumId, holder: gate.holder });
+      } catch (releaseError) {
+        // The lock expires on its own after its TTL
+        const cause = releaseError instanceof LimitStoreError ? releaseError.cause : releaseError;
+        log("error", "lock_release_failed", { forumId, code: safeErrorCode(cause) });
+      }
+    }
+  }
 }
