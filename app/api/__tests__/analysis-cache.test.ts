@@ -3,7 +3,8 @@
  */
 import type { Firestore } from "firebase-admin/firestore";
 import { FakeFirestore } from "../__fixtures__/fake-firestore";
-import type { TrustedComment } from "../analysis-comments";
+import { selectForAnalysis, type TrustedComment } from "../analysis-comments";
+import { ANALYZE_LIMITS } from "../analyze-request";
 import {
   ANALYSIS_VERSION,
   CACHE_COLLECTION,
@@ -35,6 +36,28 @@ describe("analysisCacheKey", () => {
     ["another forum", "f2", context, comments],
   ])("changes after %s", (_label, forumId, ctx, list) => {
     expect(analysisCacheKey(forumId as string, ctx as typeof context, list as TrustedComment[])).not.toBe(key);
+  });
+});
+
+describe("analysisCacheKey with the analysis selection", () => {
+  const many = Array.from({ length: ANALYZE_LIMITS.maxMessages + 1 }, (_, i) => ({
+    ...c(`m${i}`, `comment ${i}`),
+    createdAtMs: i,
+  }));
+  const keyFor = (list: TrustedComment[]) => analysisCacheKey("f1", context, selectForAnalysis(list));
+
+  it("changes when a new comment arrives or a selected comment is edited", () => {
+    const key = keyFor(many);
+    expect(keyFor([...many, { ...c("new", "newest"), createdAtMs: 10_000 }])).not.toBe(key);
+    const edited = many.map((m) => (m.id === "m500" ? { ...m, content: "edited" } : m));
+    expect(keyFor(edited)).not.toBe(key);
+  });
+
+  it("does not change for an edit or deletion outside the selection (the model input is the same)", () => {
+    const key = keyFor(many);
+    const editedOldest = many.map((m) => (m.id === "m0" ? { ...m, content: "edited" } : m));
+    expect(keyFor(editedOldest)).toBe(key);
+    expect(keyFor(many.slice(1))).toBe(key);
   });
 });
 

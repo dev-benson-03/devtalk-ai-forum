@@ -37,9 +37,12 @@ flowchart TD
   I -->|error| R502a[502 upstream_error]
   I --> J{strict validation}
   J -->|invalid| R502b[502 invalid_model_output]
-  J -->|valid| K[write cache, update forum fields]
-  K --> OK3[200 generated]
-  R502a & R502b & OK3 --> L[release lock]
+  J -->|valid| K{publish transaction:\nstill holds the lock?}
+  K -->|yes| P[write cache entry, forum fields,\nlastGeneratedAt, lastKey; release lock]
+  P --> OK3[200 generated]
+  K -->|no, lock taken over| R409b[409 in_progress, writes nothing]
+  P -->|any write fails: none applied| R503b[503/500 persist_failed]
+  R502a & R502b & R503b --> L[release own lock only]
 ```
 
 Rejected requests (401, 400, 403, 404, 409, 422, 429, 503) never call OpenAI.
@@ -61,11 +64,23 @@ Rejected requests (401, 400, 403, 404, 409, 422, 429, 503) never call OpenAI.
   version and pass the same output validation as fresh model output.
   Anything else is logged as `cache_invalid` and treated as a miss; the next
   successful generation overwrites it.
-- **Invalidation:** a new, edited or deleted comment, a changed thread, or an
-  edited forum title, description, question or tag changes the digest, so
-  the old entry is never read again. Bumping `ANALYSIS_VERSION` (do it
-  whenever the prompt, model settings or validation rules change)
-  invalidates every entry at once.
+- **Invalidation:** the key covers exactly what is sent to the model, so
+  it changes when the analyzed input changes:
+  - a new comment (new comments are the newest, so they are always
+    selected), or an edit, deletion or thread change of a selected comment;
+  - an edited forum title, description, question or first tag;
+  - bumping `ANALYSIS_VERSION` (do it whenever the prompt, model settings
+    or validation rules change), which invalidates every entry at once.
+- **What does not invalidate:** comments outside the analyzed selection.
+  The selection is the newest 500 comments, each cut to 10,000 characters,
+  with the oldest dropped until the total is at most 200,000 characters.
+  Editing or deleting a comment that was left out does not change the
+  model's input, so the cached analysis is still what a regeneration would
+  analyze; `totalMessages` and `uniqueAuthors` still reflect the change
+  because they are recomputed. Separately, the route reads at most 2,000
+  comment documents with no ordering, so in a forum with more than 2,000
+  comments the selection is drawn from an arbitrary subset (pre-existing
+  limit, no forum is near it today; fixing it needs ordered pagination).
 - **Counts:** `totalMessages` and `uniqueAuthors` are always recomputed from
   the comments loaded for the request, also on a cache hit.
 - **Client manipulation:** Firestore rules are deny-all today. Phase 3 rules
@@ -106,9 +121,25 @@ transactions. No transaction is open while OpenAI runs.
 - **Lock:** `analysisState/{forumId}.lock = { holder, key, expiresAt }`,
   taken in the same transaction that checks the cooldown and counts the
   attempt against the forum and user quotas. A second request for the forum
-  gets 409 while the lock is live. The holder releases it after the call
-  (success or failure); on success it also sets `lastGeneratedAt` and
-  `lastKey`. A request only releases its own lock.
+  gets 409 while the lock is live.
+- **Publishing results:** after OpenAI returns valid output, one
+  transaction (`publishGeneration`) first checks that this request still
+  holds the lock, then writes the cache entry, the approved forum fields,
+  `lastGeneratedAt` (starts the cooldown), `lastKey` and the lock release.
+  Firestore applies all of these or none. No transaction is open during the
+  OpenAI request.
+  - **Lock lost** (it expired and another request took it over): nothing
+    is written, the request returns 409 `in_progress`, and the client's
+    retry gets the newer analysis. The old request cannot overwrite the
+    newer state, cache entry or forum fields. Logged as `lock_lost`.
+  - **Write failure** (cache entry or forum update): nothing is applied, no
+    cooldown starts, `lastKey` is unchanged, the request releases only its
+    own lock and returns 503 (transient Firestore codes) or 500 with reason
+    `persist_failed`. The next request can generate again. Logged as
+    `persist_failed` with the safe error code.
+- **Failed generations** (OpenAI error, invalid output, write failure)
+  release the lock with `releaseGeneration`, which only clears it if this
+  request still holds it.
 - **Stale locks:** a lock past `expiresAt` (crashed or timed-out function)
   is taken over by the next request and logged as `stale_lock_recovered`.
   OpenAI calls use `timeout: 30 s` and `maxRetries: 1`, so a live request

@@ -3,10 +3,12 @@
  *
  * The digest covers everything that shapes the model's answer: the analysis
  * version, model settings, forum ID, the forum context in the prompt, and the
- * selected comments (id, thread, content) in prompt order. A new, edited or
- * deleted comment, or an edited forum title/description/question/tag, gives a
- * new key, so the old entry is simply never read again. Comment text never
- * appears in the key, only in the digest input.
+ * selected comments (id, thread, content) in prompt order, i.e. exactly the
+ * model's input. A new comment, a change to a selected comment, or an edited
+ * forum title/description/question/tag gives a new key, so the old entry is
+ * never read again. Changes to comments outside the selection (see
+ * selectForAnalysis) do not change the input and keep the key. Comment text
+ * never appears in the key, only in the digest input.
  *
  * Only the Admin SDK reads or writes this collection. Entries are validated
  * again before they are served.
