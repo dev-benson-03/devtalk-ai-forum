@@ -18,9 +18,11 @@ jest.mock('firebase/firestore', () => ({
 }));
 
 // The analysis request fails, so the modal shows its error state
+const mockAnalyze = jest.fn(() => Promise.reject(new Error('Failed to analyze messages')));
 jest.mock('../services/AnalysisService', () => ({
+  AnalysisAuthError: jest.requireActual('../services/AnalysisService').AnalysisAuthError,
   AnalysisService: jest.fn().mockImplementation(() => ({
-    analyzeMessages: jest.fn(() => Promise.reject(new Error('Failed to analyze messages')))
+    analyzeMessages: (...args: unknown[]) => mockAnalyze(...(args as []))
   }))
 }));
 
@@ -79,5 +81,20 @@ describe('TeaModal', () => {
     expect(screen.getByText(/Fetching the tea/i)).toBeInTheDocument();
     // No analysis should be shown
     expect(screen.queryByText(/The Tea/i)).toBeInTheDocument();
+  });
+
+  it('asks the user to sign in again when analysis auth fails', async () => {
+    const { AnalysisAuthError } = jest.requireActual('../services/AnalysisService');
+    mockAnalyze.mockImplementationOnce(() => Promise.reject(new AnalysisAuthError('unauthorized')));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await act(async () => {
+      render(<TeaModal {...defaultProps} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByText(/Please sign in again to spill the tea/i)).toBeInTheDocument();
+    expect(warn).toHaveBeenCalledWith('[TeaModal] Analysis needs sign-in:', 'unauthorized');
+    warn.mockRestore();
   });
 });
