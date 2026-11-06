@@ -5,8 +5,10 @@
  * Flow: authenticate (Firebase ID token) → validate { forumId, forceRegenerate }
  * → per-user request limit → load the forum and its comments with the Admin
  * SDK → authorize → cache read → generation gate (lock, cooldown, quotas) →
- * OpenAI → strict validation → cache + approved forum fields. Nothing from the
- * client except forumId and forceRegenerate is used.
+ * OpenAI → strict validation → one transaction that, only if this request
+ * still holds the lock, writes the cache entry, the approved forum fields and
+ * the cooldown. Nothing from the client except forumId and forceRegenerate
+ * is used.
  * See docs/architecture/ai-analysis.md.
  */
 
@@ -18,17 +20,20 @@ import {
   ANALYSIS_MODEL,
   ANALYSIS_TEMPERATURE,
   analysisCacheKey,
+  cacheEntry,
+  cacheRef,
   readCachedAnalysis,
-  writeCachedAnalysis,
   type AnalysisCounts,
   type ForumContext,
 } from "./analysis-cache.server";
 import { countUniqueAuthors, selectForAnalysis, toTrustedComment, type TrustedComment } from "./analysis-comments";
 import {
+  ANALYSIS_QUOTAS,
   LimitStoreError,
   acquireGeneration,
   consumeUserRequest,
-  finishGeneration,
+  publishGeneration,
+  releaseGeneration,
 } from "./analysis-limits.server";
 import { parseModelAnalysis, type AnalysisText } from "./analysis-output";
 import { readAnalysisRequest } from "./analyze-request";
@@ -284,8 +289,9 @@ async function analyze(input: AnalyzeInput): Promise<Response> {
   }
   if (gate.recoveredStaleLock) log("warn", "stale_lock_recovered", { forumId });
 
-  // 7. OpenAI, outside any transaction; the lock is always released afterwards
-  let succeeded = false;
+  // 7. OpenAI, outside any transaction. Unless the results were published
+  //    (which releases the lock atomically), the lock is released afterwards.
+  let releaseLock = true;
   try {
     const threadSummaries = buildThreadSummaries(comments);
     log("info", "openai_request", {
@@ -319,31 +325,44 @@ async function analyze(input: AnalyzeInput): Promise<Response> {
     // Invalid output is never cached, saved or replaced with made-up text; the client may retry
     if (!analysis) return json({ error: "Analysis unavailable", reason: "invalid_model_output" }, 502);
 
-    // 8. Persist: validated cache entry, then only the approved forum fields
+    // 8. Publish atomically, only while this request still owns the lock: the
+    //    cache entry, the approved forum fields, the cooldown and the lock release.
+    //    Either all of them are written or none is.
+    let published;
     try {
-      await writeCachedAnalysis(db, cacheKey, forumId, analysis, counts);
-    } catch (cacheError) {
-      log("error", "cache_write_failed", { forumId, code: safeErrorCode(cacheError) });
-    }
-    try {
-      await db.collection("forums").doc(forumId).update({
-        analysisSummary: analysis.summary,
-        actionRoadmap: analysis.actionRoadmap,
-        lastAnalyzedAt: new Date().toISOString(),
+      published = await publishGeneration(db, { forumId, holder: gate.holder, key: cacheKey }, (tx) => {
+        tx.set(cacheRef(db, cacheKey), cacheEntry(forumId, analysis, counts));
+        tx.update(db.collection("forums").doc(forumId), {
+          analysisSummary: analysis.summary,
+          actionRoadmap: analysis.actionRoadmap,
+          lastAnalyzedAt: new Date().toISOString(),
+        });
       });
-      log("info", "forum_updated", { forumId });
-    } catch (updateError) {
-      log("error", "forum_update_failed", { forumId, code: safeErrorCode(updateError) });
+    } catch (persistError) {
+      log("error", "persist_failed", { forumId, code: safeErrorCode(persistError), elapsedMs: elapsedMs() });
+      const transient = TRANSIENT_FIRESTORE_CODES.has((persistError as { code?: unknown } | null)?.code as number);
+      return transient
+        ? json({ error: "Service unavailable", reason: "persist_failed" }, 503, { "Retry-After": "5" })
+        : json({ error: "Internal server error", reason: "persist_failed" }, 500);
     }
-    succeeded = true;
+    if (!published.published) {
+      // The lock expired and another request took over; its result wins. Not ours to release.
+      releaseLock = false;
+      log("warn", "lock_lost", { forumId, keyRef, elapsedMs: elapsedMs() });
+      return retryLater(409, "Analysis in progress", "in_progress", ANALYSIS_QUOTAS.inProgressRetryMs);
+    }
+    releaseLock = false;
+    log("info", "analysis_published", { forumId, keyRef });
     return respond(analysis, "generated");
   } finally {
-    try {
-      await finishGeneration(db, { forumId, holder: gate.holder, key: cacheKey, succeeded });
-    } catch (releaseError) {
-      // The lock expires on its own after its TTL
-      const cause = releaseError instanceof LimitStoreError ? releaseError.cause : releaseError;
-      log("error", "lock_release_failed", { forumId, code: safeErrorCode(cause) });
+    if (releaseLock) {
+      try {
+        await releaseGeneration(db, { forumId, holder: gate.holder });
+      } catch (releaseError) {
+        // The lock expires on its own after its TTL
+        const cause = releaseError instanceof LimitStoreError ? releaseError.cause : releaseError;
+        log("error", "lock_release_failed", { forumId, code: safeErrorCode(cause) });
+      }
     }
   }
 }

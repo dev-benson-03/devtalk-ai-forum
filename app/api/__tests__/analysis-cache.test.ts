@@ -8,8 +8,8 @@ import {
   ANALYSIS_VERSION,
   CACHE_COLLECTION,
   analysisCacheKey,
+  cacheEntry,
   readCachedAnalysis,
-  writeCachedAnalysis,
 } from "../analysis-cache.server";
 
 const context = { title: "React", description: "Ask", question: "What next?", category: "react" };
@@ -46,7 +46,7 @@ describe("cache reads and writes", () => {
   });
 
   it("round-trips a validated analysis with metadata and timestamps", async () => {
-    await writeCachedAnalysis(db(), "k1", "f1", analysis, { totalMessages: 2, uniqueAuthors: 1 }, 1_000);
+    fake.seed(CACHE_COLLECTION, "k1", cacheEntry("f1", analysis, { totalMessages: 2, uniqueAuthors: 1 }, 1_000));
     const stored = fake.read(CACHE_COLLECTION, "k1")!;
     expect(stored).toMatchObject({ forumId: "f1", version: ANALYSIS_VERSION, model: "gpt-4o-mini", ...analysis });
     expect(stored.createdAt).toBeDefined();

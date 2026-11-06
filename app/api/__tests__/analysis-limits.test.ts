@@ -10,7 +10,8 @@ import {
   STATE_COLLECTION,
   acquireGeneration,
   consumeUserRequest,
-  finishGeneration,
+  publishGeneration,
+  releaseGeneration,
 } from "../analysis-limits.server";
 
 const T0 = 1_700_000_000_000;
@@ -44,7 +45,11 @@ describe("consumeUserRequest", () => {
   });
 });
 
-describe("acquireGeneration / finishGeneration", () => {
+const publish = (holder: string, key: string, now: number, write = () => {}) =>
+  publishGeneration(db(), { forumId: "f1", holder, key }, write, now);
+const release = (holder: string) => releaseGeneration(db(), { forumId: "f1", holder });
+
+describe("acquireGeneration / publishGeneration / releaseGeneration", () => {
   it("takes the forum lock and reports in_progress to a second request", async () => {
     const first = await gate(T0);
     expect(first).toMatchObject({ kind: "acquired", recoveredStaleLock: false });
@@ -65,7 +70,7 @@ describe("acquireGeneration / finishGeneration", () => {
   it("starts the forum cooldown on success and remembers the latest key", async () => {
     const first = await gate(T0);
     if (first.kind !== "acquired") throw new Error("expected lock");
-    await finishGeneration(db(), { forumId: "f1", holder: first.holder, key: "k1", succeeded: true }, T0 + 5);
+    expect(await publish(first.holder, "k1", T0 + 5)).toEqual({ published: true });
     expect(fake.read(STATE_COLLECTION, "f1")!.lock).toBeNull();
     expect(await gate(T0 + 10, "u2", "k2")).toEqual({
       kind: "cooldown",
@@ -78,7 +83,7 @@ describe("acquireGeneration / finishGeneration", () => {
   it("releases the lock without a cooldown after a failed generation", async () => {
     const first = await gate(T0);
     if (first.kind !== "acquired") throw new Error("expected lock");
-    await finishGeneration(db(), { forumId: "f1", holder: first.holder, key: "k1", succeeded: false }, T0 + 5);
+    await release(first.holder);
     expect(await gate(T0 + 10)).toMatchObject({ kind: "acquired" });
   });
 
@@ -86,8 +91,41 @@ describe("acquireGeneration / finishGeneration", () => {
     const first = await gate(T0);
     const second = await gate(T0 + Q.lockTtlMs + 1, "u2");
     if (first.kind !== "acquired" || second.kind !== "acquired") throw new Error("expected locks");
-    await finishGeneration(db(), { forumId: "f1", holder: first.holder, key: "k1", succeeded: false });
+    await release(first.holder);
     expect(fake.read(STATE_COLLECTION, "f1")!.lock).toMatchObject({ holder: second.holder });
+  });
+
+  it("publishes nothing once the lock was lost to another generation", async () => {
+    const first = await gate(T0, "u1", "k1");
+    const second = await gate(T0 + Q.lockTtlMs + 1, "u2", "k2");
+    if (first.kind !== "acquired" || second.kind !== "acquired") throw new Error("expected locks");
+    expect(await publish(second.holder, "k2", T0 + Q.lockTtlMs + 10)).toEqual({ published: true });
+    const before = fake.read(STATE_COLLECTION, "f1");
+
+    const write = jest.fn();
+    expect(await publish(first.holder, "k1", T0 + Q.lockTtlMs + 20, write)).toEqual({
+      published: false,
+      reason: "lock_lost",
+    });
+    expect(write).not.toHaveBeenCalled();
+    expect(fake.read(STATE_COLLECTION, "f1")).toEqual(before);
+    expect(fake.read(STATE_COLLECTION, "f1")).toMatchObject({ lastKey: "k2" });
+  });
+
+  it("applies no part of a publish whose writes fail, and keeps the lock", async () => {
+    const first = await gate(T0);
+    if (first.kind !== "acquired") throw new Error("expected lock");
+    fake.writeFailures.set("analysisCache", Object.assign(new Error("down"), { code: 14 }));
+    const writeCache = (tx: Parameters<Parameters<typeof publishGeneration>[2]>[0]) =>
+      tx.set(db().collection("analysisCache").doc("k1"), { summary: "x" });
+    await expect(publish(first.holder, "k1", T0 + 5, writeCache as never)).rejects.toMatchObject({ code: 14 });
+    expect(fake.read("analysisCache", "k1")).toBeUndefined();
+    const state = fake.read(STATE_COLLECTION, "f1")!;
+    expect(state.lastGeneratedAt).toBeUndefined();
+    expect(state.lastKey).toBeUndefined();
+    expect(state.lock).toMatchObject({ holder: first.holder });
+    await release(first.holder);
+    expect(fake.read(STATE_COLLECTION, "f1")!.lock).toBeNull();
   });
 
   it("enforces the per-user generation quota across forums", async () => {
@@ -101,7 +139,7 @@ describe("acquireGeneration / finishGeneration", () => {
     for (let i = 0; i < Q.forumGenerations.max; i++) {
       const g = await gate(T0 + i * Q.lockTtlMs * 2, `user${i}`);
       if (g.kind !== "acquired") throw new Error(`attempt ${i}: ${g.kind}`);
-      await finishGeneration(db(), { forumId: "f1", holder: g.holder, key: "k", succeeded: false });
+      await release(g.holder);
     }
     const next = await gate(T0 + Q.forumGenerations.max * Q.lockTtlMs * 2, "fresh-user");
     expect(next).toMatchObject({ kind: "limited", scope: "forum_generations" });

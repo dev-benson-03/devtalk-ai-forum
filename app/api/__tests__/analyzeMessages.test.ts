@@ -469,6 +469,66 @@ describe("analyzeMessages action", () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
+  it("never lets a generation that lost its lock overwrite a newer one", async () => {
+    let finishOld: (value: unknown) => void = () => {};
+    mockCreate
+      .mockReturnValueOnce(new Promise((resolve) => (finishOld = resolve)))
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({ summary: "Newer summary", actionRoadmap: STEPS }) } }],
+      });
+    const old = call(post({ forumId: FORUM_ID }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // The old request's lock expires; another request takes it over and publishes
+    now = T0 + Q.lockTtlMs + 1;
+    const newer = await analyzeAs("second-viewer");
+    expect(newer).toMatchObject({ status: 200, body: { summary: "Newer summary" } });
+    const key = currentKey();
+    const stateAfterNewer = { ...mockDb.read(STATE_COLLECTION, FORUM_ID) };
+    const forumWrites = mockDb.writesTo("forums").length;
+
+    // The old request finishes later with a valid but different analysis
+    now = T0 + Q.lockTtlMs + 5_000;
+    finishOld({ choices: [{ message: { content: JSON.stringify({ summary: "Stale summary", actionRoadmap: STEPS }) } }] });
+    const stale = await old;
+    expect(stale).toMatchObject({ status: 409, body: { reason: "in_progress" } });
+
+    expect(mockDb.read(STATE_COLLECTION, FORUM_ID)).toEqual(stateAfterNewer);
+    expect(stateAfterNewer).toMatchObject({ lastKey: key, lock: null });
+    expect(mockDb.writesTo("forums")).toHaveLength(forumWrites);
+    expect(forumDoc().analysisSummary).toBe("Newer summary");
+    expect(mockDb.read(CACHE_COLLECTION, key)).toMatchObject({ summary: "Newer summary" });
+    expect(loggedText()).toContain('"event":"lock_lost"');
+    expect(loggedText()).not.toContain("Stale summary");
+  });
+
+  it.each([
+    ["the cache write", CACHE_COLLECTION, 14, 503, "Service unavailable"],
+    ["the forum update", "forums", 14, 503, "Service unavailable"],
+    ["a non-transient forum update", "forums", 7, 500, "Internal server error"],
+  ])("publishes nothing when %s fails, then recovers on the next request", async (_label, collection, code, status, error) => {
+    mockDb.writeFailures.set(collection, Object.assign(new Error(`internal detail ${PRIVATE_TEXT}`), { code }));
+    const failed = await call(post({ forumId: FORUM_ID }));
+    expect(failed.status).toBe(status);
+    expect(failed.body).toEqual({ error, reason: "persist_failed" });
+    expect(mockDb.read(CACHE_COLLECTION, currentKey())).toBeUndefined();
+    expect(forumDoc().analysisSummary).toBeUndefined();
+    const state = mockDb.read(STATE_COLLECTION, FORUM_ID)!;
+    expect(state.lock).toBeNull(); // its own lock released
+    expect(state.lastGeneratedAt).toBeUndefined(); // no cooldown
+    expect(state.lastKey).toBeUndefined();
+    expect(loggedText()).toContain('"event":"persist_failed"');
+
+    mockDb.writeFailures.clear();
+    now = T0 + 1_000;
+    const recovered = await call(post({ forumId: FORUM_ID }));
+    expect(recovered).toMatchObject({ status: 200, body: { summary: "Test summary", totalMessages: 3, uniqueAuthors: 2 } });
+    expect(mockDb.read(CACHE_COLLECTION, currentKey())).toMatchObject({ summary: "Test summary" });
+    expect(forumDoc().analysisSummary).toBe("Test summary");
+    expect(mockDb.read(STATE_COLLECTION, FORUM_ID)).toMatchObject({ lastKey: currentKey(), lock: null });
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ["the user quota", RATE_LIMIT_COLLECTION],
     ["the forum lock", STATE_COLLECTION],

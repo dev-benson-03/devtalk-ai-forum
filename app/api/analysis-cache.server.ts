@@ -56,7 +56,7 @@ export type CacheRead = { status: "hit"; analysis: AnalysisText } | { status: "m
 
 /** Reads an entry and serves it only if it belongs to this forum and version and still validates. */
 export async function readCachedAnalysis(db: Firestore, key: string, forumId: string): Promise<CacheRead> {
-  const snap = await db.collection(CACHE_COLLECTION).doc(key).get();
+  const snap = await cacheRef(db, key).get();
   if (!snap.exists) return { status: "miss" };
   const data = (snap.data() ?? {}) as Record<string, unknown>;
   const analysis = validateAnalysisText(data);
@@ -64,16 +64,13 @@ export async function readCachedAnalysis(db: Firestore, key: string, forumId: st
   return { status: "hit", analysis };
 }
 
-/** Stores a validated analysis. Counts are informational; responses recompute them. */
-export async function writeCachedAnalysis(
-  db: Firestore,
-  key: string,
-  forumId: string,
-  analysis: AnalysisText,
-  counts: AnalysisCounts,
-  now = Date.now()
-): Promise<void> {
-  await db.collection(CACHE_COLLECTION).doc(key).set({
+/**
+ * The document stored for a validated analysis. Written by the route inside
+ * the publish transaction (see publishGeneration), together with the forum
+ * fields and the lock release. Counts are informational; responses recompute them.
+ */
+export function cacheEntry(forumId: string, analysis: AnalysisText, counts: AnalysisCounts, now = Date.now()) {
+  return {
     forumId,
     version: ANALYSIS_VERSION,
     model: ANALYSIS_MODEL,
@@ -82,5 +79,7 @@ export async function writeCachedAnalysis(
     ...counts,
     createdAt: FieldValue.serverTimestamp(),
     expireAt: Timestamp.fromMillis(now + CACHE_RETENTION_MS),
-  });
+  };
 }
+
+export const cacheRef = (db: Firestore, key: string) => db.collection(CACHE_COLLECTION).doc(key);

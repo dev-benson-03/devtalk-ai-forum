@@ -136,27 +136,46 @@ export function acquireGeneration(
   );
 }
 
+/** Firestore transaction handle (Admin SDK type, without importing it in the route). */
+export type AnalysisTransaction = Parameters<Parameters<Firestore["runTransaction"]>[0]>[0];
+
+export type PublishResult = { published: true } | { published: false; reason: "lock_lost" };
+
 /**
- * Releases the lock if this request still holds it. On success also records
- * the generation time (starts the cooldown) and the key of the latest valid
- * analysis, which is served during the cooldown.
+ * Publishes a finished generation in one transaction, only if this request
+ * still holds the forum's lock: `writeResults` adds the cache entry and the
+ * forum fields, and the state gets `lastGeneratedAt` (starts the cooldown),
+ * `lastKey` and a released lock. If the lock expired and another request took
+ * it over, nothing is written. If any write fails, none is applied and the
+ * error is thrown unchanged (it is a data error, not a rate-limit one).
+ * Called after the OpenAI request; no transaction is open during it.
  */
-export function finishGeneration(
+export function publishGeneration(
   db: Firestore,
-  { forumId, holder, key, succeeded }: { forumId: string; holder: string; key: string; succeeded: boolean },
+  { forumId, holder, key }: { forumId: string; holder: string; key: string },
+  writeResults: (tx: AnalysisTransaction) => void,
   now = Date.now()
-): Promise<void> {
+): Promise<PublishResult> {
+  const stateRef = db.collection(STATE_COLLECTION).doc(forumId);
+  return db.runTransaction(async (tx): Promise<PublishResult> => {
+    const state = (await tx.get(stateRef)).data() ?? {};
+    if (state.lock?.holder !== holder) return { published: false, reason: "lock_lost" };
+    writeResults(tx);
+    tx.set(stateRef, { lock: null, lastGeneratedAt: Timestamp.fromMillis(now), lastKey: key }, { merge: true });
+    return { published: true };
+  });
+}
+
+/**
+ * Releases the lock after a failed generation, only if this request still
+ * holds it. Does not start the cooldown or change the latest analysis.
+ */
+export function releaseGeneration(db: Firestore, { forumId, holder }: { forumId: string; holder: string }): Promise<void> {
   const stateRef = db.collection(STATE_COLLECTION).doc(forumId);
   return guarded(() =>
     db.runTransaction(async (tx) => {
       const state = (await tx.get(stateRef)).data() ?? {};
-      const update: Record<string, unknown> = {};
-      if (state.lock?.holder === holder) update.lock = null;
-      if (succeeded && now >= ms(state.lastGeneratedAt)) {
-        update.lastGeneratedAt = Timestamp.fromMillis(now);
-        update.lastKey = key;
-      }
-      if (Object.keys(update).length > 0) tx.set(stateRef, update, { merge: true });
+      if (state.lock?.holder === holder) tx.set(stateRef, { lock: null }, { merge: true });
     })
   );
 }
