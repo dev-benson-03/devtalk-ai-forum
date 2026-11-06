@@ -10,4 +10,6 @@ module.exports = {
   moduleNameMapper: { "^~/(.*)$": "<rootDir>/app/$1" },
   transform: { "^.+\\.tsx?$": ["ts-jest", { tsconfig: "tsconfig.test.json" }] },
   testTimeout: 30000,
+  // All files share one emulator database and clear it between tests
+  maxWorkers: 1,
 };

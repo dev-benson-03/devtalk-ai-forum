@@ -3,7 +3,7 @@
  * take the Firestore instance as a parameter so the rules tests run the same
  * code against the emulator.
  */
-import { collection, doc, query, runTransaction, serverTimestamp, where, type Firestore } from "firebase/firestore";
+import { collection, doc, getDoc, query, runTransaction, serverTimestamp, where, type Firestore } from "firebase/firestore";
 
 /**
  * Forums shown on the list page. Rules are not filters: a query is allowed
@@ -30,24 +30,46 @@ export const commentIdFor = (forumId: string, count: number) => `${forumId}_${co
 
 const currentCount = (value: unknown) => (Number.isInteger(value) ? (value as number) : 0);
 
-/** Creates the comment and increments the forum's commentCount atomically. Returns the comment ID. */
-export function createCommentRecord(db: Firestore, comment: NewComment): Promise<string> {
+/** Tries before giving up when other comments keep landing first. */
+export const COMMENT_ATTEMPTS = 3;
+
+/**
+ * Creates the comment and increments the forum's commentCount atomically.
+ * Returns the comment ID.
+ *
+ * If someone else's comment took number n first, Firestore can reject this
+ * transaction as permission-denied (the rules see that <forumId>_<n> already
+ * exists) instead of retrying it. So when the count moved on, try again with
+ * the new number; any other denial is final.
+ */
+export async function createCommentRecord(db: Firestore, comment: NewComment): Promise<string> {
   const forumRef = doc(db, "forums", comment.forumId);
-  return runTransaction(db, async (tx) => {
-    const forum = await tx.get(forumRef);
-    if (!forum.exists()) throw new Error("Forum not found");
-    const next = currentCount(forum.data().commentCount) + 1;
-    const commentRef = doc(db, "comments", commentIdFor(comment.forumId, next));
-    tx.set(commentRef, {
-      forumId: comment.forumId,
-      userId: comment.userId,
-      userName: comment.userName,
-      content: comment.content,
-      createdAt: serverTimestamp(),
-      upvotes: 0,
-      downvotes: 0,
-    });
-    tx.update(forumRef, { commentCount: next });
-    return commentRef.id;
-  });
+  for (let attempt = 1; ; attempt++) {
+    let usedCount = -1;
+    try {
+      return await runTransaction(db, async (tx) => {
+        const forum = await tx.get(forumRef);
+        if (!forum.exists()) throw new Error("Forum not found");
+        usedCount = currentCount(forum.data().commentCount);
+        const next = usedCount + 1;
+        const commentRef = doc(db, "comments", commentIdFor(comment.forumId, next));
+        tx.set(commentRef, {
+          forumId: comment.forumId,
+          userId: comment.userId,
+          userName: comment.userName,
+          content: comment.content,
+          createdAt: serverTimestamp(),
+          upvotes: 0,
+          downvotes: 0,
+        });
+        tx.update(forumRef, { commentCount: next });
+        return commentRef.id;
+      });
+    } catch (error) {
+      const denied = (error as { code?: unknown } | null)?.code === "permission-denied";
+      if (!denied || usedCount < 0 || attempt >= COMMENT_ATTEMPTS) throw error;
+      const latest = await getDoc(forumRef);
+      if (!latest.exists() || currentCount(latest.data().commentCount) === usedCount) throw error;
+    }
+  }
 }

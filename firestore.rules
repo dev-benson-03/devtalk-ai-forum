@@ -1,7 +1,221 @@
 rules_version = '2';
+
+// DevTalk Firestore Security Rules (Phase 3A). Not deployed: tested only
+// against the local emulator (npm run test:rules).
+// Design and access matrix: docs/architecture/firestore-rules.md
+//
+// Everything not matched below is denied. The server (Firebase Admin SDK)
+// bypasses these rules and does its own checks (app/auth/forum-access.ts).
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
+
+    // ---- Identity ---------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Admin only via a verified custom claim, never a UID list or client flag
+    function isAdmin() {
+      return signedIn() && request.auth.token.get('admin', false) == true;
+    }
+
+    // Same as the server: a real UID match; "anonymous" creators own nothing
+    function isCreator(forum) {
+      return signedIn()
+        && forum.get('creatorId', '') is string
+        && forum.get('creatorId', '') != ''
+        && forum.get('creatorId', '') != 'anonymous'
+        && forum.get('creatorId', '') == request.auth.uid;
+    }
+
+    // ---- Forum visibility (mirrors canViewForum on the server) -----------
+
+    function isAdminDeleted(forum) {
+      return forum.get('isAdminDeleted', false) == true;
+    }
+
+    function isInactive(forum) {
+      return forum.get('isActive', true) == false;
+    }
+
+    function canViewForum(forum) {
+      return signedIn() && (
+        isAdminDeleted(forum) ? isAdmin()
+        : isInactive(forum) ? (isCreator(forum) || isAdmin())
+        : true
+      );
+    }
+
+    // Open for new comments: viewable, active, not deleted, not past endTime.
+    // Legacy forums without endTime stay open, as in the forum page.
+    function acceptsComments(forum) {
+      return canViewForum(forum)
+        && !isAdminDeleted(forum)
+        && !isInactive(forum)
+        && (!('endTime' in forum) || (forum.endTime is timestamp && forum.endTime > request.time));
+    }
+
+    function forumPath(forumId) {
+      return /databases/$(database)/documents/forums/$(forumId);
+    }
+
+    function commentPath(commentId) {
+      return /databases/$(database)/documents/comments/$(commentId);
+    }
+
+    // ---- Field validation ------------------------------------------------
+
+    function text(value, min, max) {
+      return value is string && value.size() >= min && value.size() <= max;
+    }
+
+    function nonBlank(value, max) {
+      return text(value, 1, max) && value.trim().size() > 0;
+    }
+
+    function validTags(tags) {
+      return tags is list
+        && tags.size() <= 1
+        && (tags.size() == 0 || nonBlank(tags[0], 50));
+    }
+
+    function commentCountOf(forum) {
+      return forum.get('commentCount', 0);
+    }
+
+    // ---- forums ----------------------------------------------------------
+
+    match /forums/{forumId} {
+      // Detail page (getDoc) and the AI modal's forum context
+      allow get: if canViewForum(resource.data);
+
+      // Forum list: only queries restricted to listed forums are allowed
+      // (where isActive == true and isAdminDeleted == false). Admins may list all.
+      allow list: if signedIn() && (
+        isAdmin()
+        || (resource.data.isActive == true && resource.data.isAdminDeleted == false)
+      );
+
+      // Create: exactly the create-forum page's fields, owned by the caller,
+      // active, not deleted, ending within the form's 1-week maximum, with
+      // the analysis fields empty (the server writes those).
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+             'title', 'description', 'question', 'creatorId', 'creatorName',
+             'endTime', 'isActive', 'isAdminDeleted', 'tags', 'messages',
+             'summary', 'actionRoadmap'])
+        && request.resource.data.keys().hasAll([
+             'title', 'description', 'question', 'creatorId', 'creatorName',
+             'endTime', 'isActive', 'isAdminDeleted'])
+        && request.resource.data.creatorId == request.auth.uid
+        && nonBlank(request.resource.data.creatorName, 256)
+        && nonBlank(request.resource.data.title, 200)
+        && nonBlank(request.resource.data.description, 2000)
+        && nonBlank(request.resource.data.question, 1000)
+        && request.resource.data.isActive == true
+        && request.resource.data.isAdminDeleted == false
+        && request.resource.data.endTime is timestamp
+        && request.resource.data.endTime > request.time
+        && request.resource.data.endTime <= request.time + duration.value(8, 'd')
+        && validTags(request.resource.data.get('tags', []))
+        && request.resource.data.get('messages', []) in [[], ['']]
+        && request.resource.data.get('summary', '') == ''
+        && request.resource.data.get('actionRoadmap', []) in [[], ['']];
+
+      allow update: if signedIn() && (
+        commentCountIncrement(forumId)
+        || creatorEdit()
+        || adminModeration()
+      );
+
+      // Hard delete only for admins; creators can hide a forum with isActive
+      allow delete: if isAdmin();
+
+      // +1 to commentCount, nothing else, and only together with the new
+      // comment <forumId>_<n> created in the same transaction (whose own
+      // rule checks the author, the forum and the content).
+      function commentCountIncrement(forumId) {
+        let next = request.resource.data.get('commentCount', 0);
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentCount'])
+          && next is int
+          && next == commentCountOf(resource.data) + 1
+          && !exists(commentPath(forumId + '_' + string(next)))
+          && existsAfter(commentPath(forumId + '_' + string(next)));
+      }
+
+      // The creator may edit the text, category and visibility of their own
+      // forum. Ownership, admin status, endTime, counters and analysis
+      // fields can't change. Admin-deleted forums are frozen.
+      function creatorEdit() {
+        let changed = request.resource.data.diff(resource.data).affectedKeys();
+        let data = request.resource.data;
+        return isCreator(resource.data)
+          && !isAdminDeleted(resource.data)
+          && changed.hasOnly(['title', 'description', 'question', 'tags', 'isActive'])
+          && (!changed.hasAny(['title']) || nonBlank(data.title, 200))
+          && (!changed.hasAny(['description']) || nonBlank(data.description, 2000))
+          && (!changed.hasAny(['question']) || nonBlank(data.question, 1000))
+          && (!changed.hasAny(['tags']) || validTags(data.tags))
+          && (!changed.hasAny(['isActive']) || data.isActive is bool);
+      }
+
+      // Admins (verified claim) may hide, restore or soft-delete any forum
+      function adminModeration() {
+        let changed = request.resource.data.diff(resource.data).affectedKeys();
+        return isAdmin()
+          && changed.hasOnly(['isActive', 'isAdminDeleted'])
+          && request.resource.data.get('isActive', true) is bool
+          && request.resource.data.get('isAdminDeleted', false) is bool;
+      }
+    }
+
+    // ---- comments --------------------------------------------------------
+
+    match /comments/{commentId} {
+      // Readable when the parent forum is. The forum page queries
+      // where('forumId', '==', id), which lets the rule read that forum.
+      allow read: if signedIn()
+        && resource.data.get('forumId', '') is string
+        && canViewForum(get(forumPath(resource.data.forumId)).data);
+
+      // Create: author is the caller's UID (any display name, including
+      // "Anonymous User"), the forum accepts comments, and the forum's
+      // commentCount goes up by one to this comment's number in the same
+      // transaction.
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+             'forumId', 'userId', 'userName', 'content', 'createdAt', 'upvotes', 'downvotes'])
+        && request.resource.data.keys().hasAll([
+             'forumId', 'userId', 'userName', 'content', 'createdAt', 'upvotes', 'downvotes'])
+        && request.resource.data.userId == request.auth.uid
+        && nonBlank(request.resource.data.userName, 256)
+        && nonBlank(request.resource.data.content, 5000)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.upvotes == 0
+        && request.resource.data.downvotes == 0
+        && request.resource.data.forumId is string
+        && exists(forumPath(request.resource.data.forumId))
+        && acceptsComments(get(forumPath(request.resource.data.forumId)).data)
+        && commentId == request.resource.data.forumId + '_'
+             + string(commentCountOf(get(forumPath(request.resource.data.forumId)).data) + 1)
+        && getAfter(forumPath(request.resource.data.forumId)).data.get('commentCount', 0)
+             == commentCountOf(get(forumPath(request.resource.data.forumId)).data) + 1;
+
+      // No editing in the product; admins may remove a comment
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // ---- Server-only collections (Admin SDK) -----------------------------
+
+    match /analysisCache/{docId} {
+      allow read, write: if false;
+    }
+    match /analysisState/{docId} {
+      allow read, write: if false;
+    }
+    match /analysisRateLimits/{docId} {
       allow read, write: if false;
     }
   }
