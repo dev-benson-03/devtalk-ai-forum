@@ -165,100 +165,83 @@ replaced with `unknown` unless it matches `^(auth|app|admin)/[a-z0-9-]+$`.
 reports `auth/argument-error`, the same code as a bad token, so that outage
 returns 401 rather than 503. Telling them apart would mean parsing messages.
 
-## Plan for `app/api/analyzeMessages.ts`
+## AI analysis endpoint (`app/api/analyzeMessages.ts`), Phase 2B
 
-**Verified** current behavior:
+Steps 1–5 and 7 of the original migration plan are done (Phase 2A sent the
+token and validated input; Phase 2B enforces auth and uses trusted data).
+Writing `analysisCache` (step 6) and rate limiting are still open.
 
-- No authentication: any caller can POST (`action`, line ~38).
-- Uses the browser Firebase SDK on the server (`import { db } from "../firebase/config.js"`),
-  so reads and writes run unauthenticated and depend on Firestore rules.
-  **Inferred**: under the current deny-all rules both fail (the cache read is
-  caught and skipped; the forum update is caught and logged).
-- Trusts client-sent `forumId` and `messages`; no payload validation.
-- Writes `analysisSummary`, `actionRoadmap`, `lastAnalyzedAt` to `forums/{forumId}`,
-  including a canned fallback summary when the model's JSON can't be parsed.
-- Reads `analysisCache/{key}` but never writes it.
-- Logs the full model output and the forum context (`console.log(aiResponse)`).
-- Live caller: `TeaModal` through `AnalysisService.analyzeMessages`
-  (`app/message/services/AnalysisService.ts`), only reached from
-  `app/forum/forum-detail.tsx`, which already redirects signed-out users to
-  `/login`. `MessageList.analyzeMessages` is defined but never invoked.
+### Firestore fields used (Verified from the code that writes them)
 
-## Phase 2A status: transitional, not yet secure
-
-Steps 1 and 2 below are done. **The endpoint still accepts unauthenticated
-requests**; anyone can call it until Phase 2B adds `requireUser(request)`.
-
-**Request flow (Verified):** `forum-detail.tsx` (redirects signed-out users to
-`/login`) → "What's Tea" button → `TeaModal` reads the forum's `comments` with
-the client SDK → `AnalysisService.analyzeMessages` → `POST /api/analyzeMessages`.
-TeaModal sends `{ forumId, forumTitle, forumDescription?, forumQuestion?,
-category?, messages: [{ id, content, userName, createdAt, forumId }] }`; the
-server's old type expected `{ id: number, author, content, timestamp }`, so
-`uniqueAuthors` is always 1 for TeaModal requests (unchanged here). Response:
-`{ totalMessages, uniqueAuthors, summary, actionRoadmap }`. `MessageList`
-also defines a call to the endpoint but never invokes it.
-
-**Client (`AnalysisService`):** waits for `firebaseAuth.authStateReady()`, takes
-`currentUser`, sends `Authorization: Bearer <getIdToken()>`. A 401 is retried
-once with `getIdToken(true)`. Failures throw `AnalysisAuthError` with reason
-`signed_out`, `token_unavailable` or `unauthorized` (no token inside);
-`TeaModal` shows "Please sign in again to spill the tea" for these and keeps
-its existing message for other errors.
-
-**Server validation (`app/api/analyze-request.ts`)**, before any Firestore or
-OpenAI call. Failures return `{ error: "Invalid request", reason }` with 400,
-or `{ error: "Request too large", reason: "body_too_large" }` with 413.
-
-| Rule | Limit / format | Why |
+| Purpose | Collection.field | Written by |
 | --- | --- | --- |
-| Body size | 512 KiB (Content-Length checked first, then actual bytes) | Fits 200k chars of mostly-ASCII content plus normal metadata; an outer cap even if every field is near its own limit. Vercel allows 4.5 MB |
-| JSON | must parse to a plain object | |
-| `forumId` | required, `^[A-Za-z0-9_-]{1,128}$`, not `__x__` | Firestore auto-IDs are 20 alphanumerics; blocks paths like `a/b` |
-| `forumTitle`, `forumDescription`, `forumQuestion`, `category` | optional strings, ≤ 2,000 chars | |
-| `messages` | array of 1–500 | the 43 migrated docs span all forums; ample headroom |
-| message `id` | doc-ID string or non-negative integer | TeaModal sends doc IDs, older callers numbers |
-| message `content` | required string, ≤ 10,000 chars | |
-| total `content` | ≤ 200,000 chars (~50k tokens) | bounds OpenAI prompt size and cost |
-| `author`, `userName`, `timestamp`, `threadId`, `forumId` | optional strings, ≤ 2,000 chars | |
-| `createdAt` | optional: string, `null`, or `{ seconds, nanoseconds, type? }` | how a Firestore Timestamp serializes |
+| Forum owner | `forums.creatorId` (UID, or `"anonymous"`) | `forum/create-forum.tsx` |
+| Visibility | `forums.isActive` (forum list hides `false`), `forums.isAdminDeleted` | `create-forum.tsx`, `hooks/useFirestore.ts` |
+| Closure | `forums.endTime` (closed forums stay viewable) | `create-forum.tsx` |
+| Forum context | `forums.title`, `description`, `question`, `tags[0]` | `create-forum.tsx` |
+| Comment author | `comments.userId` (UID, or `"anonymous"` when signed out), `comments.userName` (display name or `"Anonymous User"`) | `forum/forum-detail.tsx` |
+| Comment → forum | `comments.forumId` | `forum-detail.tsx` |
+| Thread | `comments.parentId` (declared in `useFirestore.ts`; nothing writes it yet, so all comments are thread `"main"`, as before) | — |
+| Analysis | `forums.analysisSummary`, `forums.actionRoadmap`, `forums.lastAnalyzedAt`; cache `analysisCache/{analysis_<forumId>_<md5>}` (read only; nothing writes it) | this route |
+| Admin | none on the server. The app's only admin check is a hardcoded UID in the browser (`account/login.tsx`), which the server ignores | — |
 
-Only these fields are copied forward; anything else (for example `uid`,
-`userId`) is dropped, so client-supplied user IDs can never drive
-authorization.
+### Request flow
 
-**Proposed** migration, one small PR each, in order:
+`forum-detail.tsx` → "What's Tea" → `TeaModal` → `AnalysisService.analyzeMessages({ forumId })`
+with `Authorization: Bearer <ID token>` → `POST /api/analyzeMessages`:
 
-1. **Client sends the token.** `AnalysisService` adds the `Authorization`
-   header from `firebaseAuth.currentUser.getIdToken()`. The server still
-   accepts calls without it, so nothing breaks.
-2. **Server validates the payload.** Require a non-empty string `forumId`
-   (Firestore id characters only) and cap message count and length; return 400
-   otherwise. Ignore any `uid` / `userId` in the body.
-3. **Server requires auth.** Call `requireUser(request)` first; 401 without a
-   valid token. Ship after step 1 is deployed so live clients already send it.
-4. **Server reads its own data.** Load the forum and its comments with
-   `getAdminDb()` instead of trusting client `messages`; 404 if the forum is
-   missing or `isAdminDeleted`.
-5. **Authorize the write.** Decide who may refresh a forum's analysis (open
-   question below), then write only `analysisSummary`, `actionRoadmap`,
-   `lastAnalyzedAt` through the Admin SDK. Stop persisting the fallback
-   summary (already queued as its own ticket).
-6. **Cache server-side.** Read and write `analysisCache` with the Admin SDK;
-   rules keep it closed to clients.
-7. **Trim logs.** Log ids and counts only, never message text or model output.
+1. `requireUser(request)`: 401 / 503 / 500 per the Phase 1.1 table. Nothing
+   else runs on failure.
+2. Body: `{ forumId, forceRegenerate? }` (≤ 512 KiB JSON, `forumId` matches
+   `^[A-Za-z0-9_-]{1,128}$`, `forceRegenerate` boolean). Everything else the
+   client sends (messages, titles, `uid`, admin flags) is ignored. 400 / 413.
+3. Forum loaded with `getAdminDb()`. 404 if missing.
+4. Authorization (`app/auth/forum-access.ts`), 403 on failure:
+   - `isAdminDeleted: true` → admins only (even the creator is refused).
+   - `isActive: false` → creator or admin.
+   - otherwise any signed-in user (matches what the forum page shows).
+   - `forceRegenerate: true` (skip the cache) → creator or admin.
+   - Admin = verified ID token custom claim `admin: true`. No account has it
+     yet, so admin rights are off and those paths fail closed.
+5. Comments: `comments where forumId == id`, at most 2,000 docs read. 422
+   `no_comments` if there are none (OpenAI is not called).
+6. Limits before OpenAI: newest 500 comments, 10,000 chars each, 200,000
+   chars total (oldest dropped first).
+7. `totalMessages` = comments loaded; `uniqueAuthors` = distinct `userId`,
+   else (legacy) case-insensitive `userName`. `"anonymous"` IDs, `"Anonymous
+   User"` names and missing authors are not counted.
+8. Cache read (skipped when forcing), then the unchanged `gpt-4o-mini`
+   prompt with `temperature: 0.3`, built from the trusted forum and comments.
+9. Only a successfully parsed analysis is saved, and only `analysisSummary`,
+   `actionRoadmap` (strings only) and `lastAnalyzedAt`. The fallback text is
+   still returned to the user but no longer saved.
+10. Firestore errors: gRPC 4 / 8 / 14 → 503, others → 500. OpenAI errors → 500.
 
-**Compatibility requirements**
+Response shape is unchanged: `{ totalMessages, uniqueAuthors, summary, actionRoadmap }`.
 
-- Keep the response shape `{ totalMessages, uniqueAuthors, summary, actionRoadmap }`
-  and the `gpt-4o-mini` call (model, prompt, `temperature: 0.3`).
-- `OPENAI_API_KEY` stays server-only (`process.env`, no `VITE_` prefix).
-- Step 1 must be deployed before step 3, or the Tea modal will get 401s.
-- The server needs Admin credentials in Vercel before step 4.
+### Logging
 
-**Open questions for Devyn**
+Server: one structured object per step, `[analyzeMessages] { event, forumId,
+status, totalMessages, analyzedMessages, threads, responseLength, elapsedMs,
+code }`. Client: `[TeaModal] analysis { forumId, outcome, elapsedMs }`. No
+tokens, comment text, forum conversations, model output, UIDs or keys.
 
-- Who may trigger analysis for a forum: any signed-in user, only the creator
-  (`creatorId`), or admins? This decides the authorization check in step 5.
-- Which Vercel credential option to use (service-account fields now, or
-  Workload Identity Federation).
+### Remaining risks (for Phase 2C and later)
+
+- **Cost abuse:** any signed-in user can trigger a full OpenAI call per
+  request; nothing writes `analysisCache` and there is no rate limit. A loop
+  with a valid token can run up OpenAI cost and Firestore reads (≤ 2,000
+  comment docs per call).
+- **Any signed-in user can overwrite a forum's saved analysis fields** by
+  requesting analysis (intended: viewers may analyze), but the saved value
+  always comes from the server's own OpenAI call.
+- **No admin role yet:** set an `admin` custom claim with the Admin SDK and
+  remove the hardcoded browser UID before relying on admin paths.
+- **Anonymous comments** still store the real UID in `userId` (pre-existing);
+  it is only used for counting and is never sent to OpenAI or logged.
+- **Comment prompt injection:** comment text goes to the model as before;
+  the saved fields are type-checked but their wording is model-controlled.
+- **2,000-doc read cap** has no ordering, so a forum with more comments
+  analyzes an arbitrary subset (none are that large today).
+- **Firestore rules** are still deny-all, so the forum page's own client
+  reads fail until rules are published; this route does not depend on them.

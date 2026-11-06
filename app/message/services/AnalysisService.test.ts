@@ -5,11 +5,7 @@ import { AnalysisAuthError, AnalysisService } from './AnalysisService';
 const SECRET_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.SECRET-PAYLOAD.SECRET-SIGNATURE';
 const FRESH_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.FRESH-PAYLOAD.FRESH-SIGNATURE';
 
-const payload = {
-  forumId: 'f1',
-  forumTitle: 'Forum',
-  messages: [{ id: 1, author: 'A', content: 'msg', timestamp: '2025-01-01T00:00:00Z' }],
-};
+const payload = { forumId: 'f1' };
 
 const mockResponse: MessageAnalysisResponse = {
   totalMessages: 2,
@@ -100,12 +96,21 @@ describe('AnalysisService', () => {
     expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps the existing error for other failed responses', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue(reply(500));
-    await expect(serviceFor(fakeUser(getIdToken)).analyzeMessages(payload)).rejects.toThrow(
-      'Failed to analyze messages'
-    );
+  it('keeps the existing error for other failed responses, with the status only', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(reply(503, { error: 'Service unavailable' }));
+    const error = await serviceFor(fakeUser(getIdToken)).analyzeMessages(payload).catch((e) => e);
+    expect(error.message).toBe('Failed to analyze messages');
+    expect(error.status).toBe(503);
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends only the forum ID and optional forceRegenerate flag', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(reply(200, mockResponse));
+    await serviceFor(fakeUser(getIdToken)).analyzeMessages({ forumId: 'f1', forceRegenerate: true });
+    expect(JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body)).toEqual({
+      forumId: 'f1',
+      forceRegenerate: true,
+    });
   });
 
   it('error messages never contain a token', () => {
