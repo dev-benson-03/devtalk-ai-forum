@@ -212,7 +212,7 @@ or `{ error: "Request too large", reason: "body_too_large" }` with 413.
 
 | Rule | Limit / format | Why |
 | --- | --- | --- |
-| Body size | 512 KiB (Content-Length checked first, then actual bytes) | ~2.5x the largest valid payload; Vercel allows 4.5 MB |
+| Body size | 512 KiB (Content-Length checked first, then actual bytes) | Fits 200k chars of mostly-ASCII content plus normal metadata; an outer cap even if every field is near its own limit. Vercel allows 4.5 MB |
 | JSON | must parse to a plain object | |
 | `forumId` | required, `^[A-Za-z0-9_-]{1,128}$`, not `__x__` | Firestore auto-IDs are 20 alphanumerics; blocks paths like `a/b` |
 | `forumTitle`, `forumDescription`, `forumQuestion`, `category` | optional strings, ≤ 2,000 chars | |
