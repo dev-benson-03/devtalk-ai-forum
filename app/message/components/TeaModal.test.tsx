@@ -1,28 +1,12 @@
 import { act, render, screen } from '@testing-library/react';
 import TeaModal from './TeaModal';
 
-// Mock Firestore and analysisService
-jest.mock('../../firebase', () => ({ db: {} }));
-jest.mock('firebase/firestore', () => ({
-  collection: jest.fn(),
-  query: jest.fn(),
-  where: jest.fn(),
-  getDocs: jest.fn(() => Promise.resolve({
-    docs: [
-      { id: '1', data: () => ({ content: 'Test message', userName: 'User1', createdAt: '2025-10-26', forumId: 'forum1' }) },
-      { id: '2', data: () => ({ content: 'Another message', userName: 'User2', createdAt: '2025-10-26', forumId: 'forum1' }) }
-    ]
-  })),
-    getFirestore: jest.fn(), // <-- Add this line
-
-}));
-
-// The analysis request fails, so the modal shows its error state
-const mockAnalyze = jest.fn(() => Promise.reject(new Error('Failed to analyze messages')));
+// TeaModal no longer reads Firestore; it only calls AnalysisService with the forum ID
+const mockAnalyze = jest.fn();
 jest.mock('../services/AnalysisService', () => ({
   AnalysisAuthError: jest.requireActual('../services/AnalysisService').AnalysisAuthError,
   AnalysisService: jest.fn().mockImplementation(() => ({
-    analyzeMessages: (...args: unknown[]) => mockAnalyze(...(args as []))
+    analyzeMessages: (...args: unknown[]) => mockAnalyze(...args)
   }))
 }));
 
@@ -35,27 +19,58 @@ const defaultProps = {
   category: 'General'
 };
 
+const renderModal = async () => {
+  await act(async () => {
+    render(<TeaModal {...defaultProps} />);
+  });
+  await act(async () => {
+    await Promise.resolve();
+  });
+};
+
 describe('TeaModal', () => {
-  it('shows loading then analysis results', async () => {
-    await act(async () => {
-      render(<TeaModal {...defaultProps} />);
+  let info: jest.SpyInstance;
+
+  beforeEach(() => {
+    mockAnalyze.mockReset();
+    mockAnalyze.mockRejectedValue(Object.assign(new Error('Failed to analyze messages'), { status: 500 }));
+    info = jest.spyOn(console, 'info').mockImplementation(() => {});
+  });
+  afterEach(() => info.mockRestore());
+
+  it('requests analysis with only the forum ID', async () => {
+    await renderModal();
+    expect(mockAnalyze).toHaveBeenCalledWith({ forumId: 'forum1' });
+  });
+
+  it('shows loading while the analysis is pending', async () => {
+    mockAnalyze.mockReturnValue(new Promise(() => {}));
+    await renderModal();
+    expect(screen.getByText(/Fetching the tea/i)).toBeInTheDocument();
+  });
+
+  it('shows the analysis results', async () => {
+    mockAnalyze.mockResolvedValue({
+      totalMessages: 3,
+      uniqueAuthors: 2,
+      summary: 'Test summary',
+      actionRoadmap: ['Step 1', 'Step 2', 'Step 3'],
     });
-    // Wait for analysis to appear
-    await act(async () => {
-      // Wait for useEffect and promises
-      await Promise.resolve();
-    });
+    await renderModal();
+    expect(screen.getByText('3 messages • 2 authors')).toBeInTheDocument();
+    expect(screen.getByText('Test summary')).toBeInTheDocument();
+    expect(screen.getByText('Step 3')).toBeInTheDocument();
+  });
+
+  it('shows the error state when analysis fails', async () => {
+    await renderModal();
     expect(screen.getByText(/What's Tea?/i)).toBeInTheDocument();
-    expect(screen.getByText(/Forum Title/i)).toBeInTheDocument();
-    expect(screen.getByText(/Forum Description/i)).toBeInTheDocument();
-    expect(screen.getByText(/General/i)).toBeInTheDocument();
     expect(screen.getByText(/Unable to spill the tea right now 🫖/i)).toBeInTheDocument();
+    expect(info).toHaveBeenCalledWith('[TeaModal] analysis', expect.objectContaining({ forumId: 'forum1', outcome: 'failed_500' }));
   });
 
   it('shows forum metadata', async () => {
-    await act(async () => {
-      render(<TeaModal {...defaultProps} />);
-    });
+    await renderModal();
     expect(screen.getByText('Forum Title')).toBeInTheDocument();
     expect(screen.getByText('Forum Description')).toBeInTheDocument();
     expect(screen.getByText(/Forum Question/i)).toBeInTheDocument();
@@ -63,38 +78,24 @@ describe('TeaModal', () => {
   });
 
   it('calls onClose when close button is clicked', async () => {
-    await act(async () => {
-      render(<TeaModal {...defaultProps} />);
-    });
-    const closeBtn = screen.getByRole('button', { name: /✕/i });
-    closeBtn.click();
+    await renderModal();
+    screen.getByRole('button', { name: /✕/i }).click();
     expect(defaultProps.onClose).toHaveBeenCalled();
-  });
-
-  it('handles empty messages gracefully', async () => {
-    // Patch getDocs to return no messages
-    const { getDocs } = require('firebase/firestore');
-    getDocs.mockImplementationOnce(() => Promise.resolve({ docs: [] }));
-    await act(async () => {
-      render(<TeaModal {...defaultProps} />);
-    });
-    expect(screen.getByText(/Fetching the tea/i)).toBeInTheDocument();
-    // No analysis should be shown
-    expect(screen.queryByText(/The Tea/i)).toBeInTheDocument();
   });
 
   it('asks the user to sign in again when analysis auth fails', async () => {
     const { AnalysisAuthError } = jest.requireActual('../services/AnalysisService');
-    mockAnalyze.mockImplementationOnce(() => Promise.reject(new AnalysisAuthError('unauthorized')));
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    await act(async () => {
-      render(<TeaModal {...defaultProps} />);
-    });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    mockAnalyze.mockRejectedValue(new AnalysisAuthError('unauthorized'));
+    await renderModal();
     expect(screen.getByText(/Please sign in again to spill the tea/i)).toBeInTheDocument();
-    expect(warn).toHaveBeenCalledWith('[TeaModal] Analysis needs sign-in:', 'unauthorized');
-    warn.mockRestore();
+    expect(info).toHaveBeenCalledWith('[TeaModal] analysis', expect.objectContaining({ outcome: 'auth_unauthorized' }));
+  });
+
+  it('logs only content-free diagnostics', async () => {
+    mockAnalyze.mockResolvedValue({ totalMessages: 1, uniqueAuthors: 1, summary: 'PRIVATE SUMMARY', actionRoadmap: [] });
+    await renderModal();
+    const logged = JSON.stringify(info.mock.calls);
+    expect(logged).not.toContain('PRIVATE SUMMARY');
+    expect(Object.keys(info.mock.calls[0][1]).sort()).toEqual(['elapsedMs', 'forumId', 'outcome']);
   });
 });

@@ -3,10 +3,7 @@
  * Modal popup for displaying AI analysis results in a chat-like interface
  */
 
-import { collection, getDocs, query, where } from 'firebase/firestore';
 import { useEffect, useState } from 'react';
-import { db } from '../../firebase/config';
-import type { Message } from '../models/Message';
 import { AnalysisAuthError, AnalysisService, type MessageAnalysisResponse } from '../services/AnalysisService';
 
 interface TeaModalProps {
@@ -23,69 +20,36 @@ const analysisService = new AnalysisService();
 export default function TeaModal({ onClose, forumId, forumTitle, forumDescription, forumQuestion, category }: TeaModalProps) {
   const [analysis, setAnalysis] = useState<MessageAnalysisResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [messages, setMessages] = useState<Message[]>([]);
   const [needsSignIn, setNeedsSignIn] = useState(false);
 
   useEffect(() => {
-    const fetchMessages = async () => {
-      console.log('[TeaModal] Fetching messages from Firestore for forum:', forumId);
-      const q = query(collection(db, 'comments'), where('forumId', '==', forumId));
-      const snapshot = await getDocs(q);
-      const fetchedMessages = snapshot.docs.map(doc => {
-        const data = doc.data();
-        return {
-          id: doc.id,
-          content: data.content,
-          userName: data.userName,
-          createdAt: data.createdAt,
-          forumId: data.forumId,
-          // Add other fields as needed from Message model
-        };
-      });
-      console.log('[TeaModal] Number of messages fetched:', fetchedMessages.length);
-      setMessages(fetchedMessages as unknown as Message[]);
-    };
-    fetchMessages();
-  }, [forumId]);
-
-  useEffect(() => {
-    if (messages.length === 0) return;
+    let cancelled = false;
     const fetchAnalysis = async () => {
+      const started = Date.now();
+      let outcome = 'ok';
       try {
-        console.log('[TeaModal] Sending', messages.length, 'messages for analysis');
-        console.log('[TeaModal] Analyzing forumId:', forumId);
-        // Debug: Log what we're sending to the API
-        console.log('TeaModal sending to API:', {
-          forumId,
-          forumTitle,
-          forumDescription,
-          forumQuestion,
-          category,
-          messages: messages.map(m => m)
-        });
-        const result = await analysisService.analyzeMessages({
-          forumId,
-          forumTitle,
-          forumDescription,
-          forumQuestion,
-          category,
-          messages
-        });
-        setAnalysis(result);
+        // The server reads the forum's comments itself; only the ID is sent
+        const result = await analysisService.analyzeMessages({ forumId });
+        if (!cancelled) setAnalysis(result);
       } catch (error) {
         if (error instanceof AnalysisAuthError) {
-          // Log the reason only; the error never carries a token
-          console.warn('[TeaModal] Analysis needs sign-in:', error.reason);
-          setNeedsSignIn(true);
+          outcome = `auth_${error.reason}`;
+          if (!cancelled) setNeedsSignIn(true);
         } else {
-          console.error('Analysis failed:', error);
+          const status = (error as { status?: unknown })?.status;
+          outcome = typeof status === 'number' ? `failed_${status}` : 'failed';
         }
       } finally {
-        setLoading(false);
+        // Structured, content-free diagnostics: no messages, tokens or AI output
+        console.info('[TeaModal] analysis', { forumId, outcome, elapsedMs: Date.now() - started });
+        if (!cancelled) setLoading(false);
       }
     };
     fetchAnalysis();
-  }, [messages, forumId, forumTitle, forumDescription, forumQuestion, category]);
+    return () => {
+      cancelled = true;
+    };
+  }, [forumId]);
 
   return (
     <div className="fixed inset-0 bg-blue-900 bg-opacity-50 flex items-center justify-center z-50 animate-fadeIn">

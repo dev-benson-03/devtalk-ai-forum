@@ -44,17 +44,15 @@ export class AnalysisService {
   }
 
   /**
-   * Analyzes messages using the secure OpenAI API endpoint with forum context.
+   * Asks the server to analyze a forum. The server loads the forum and its
+   * comments itself, so only the forum ID is sent.
    * Sends the user's Firebase ID token. On a 401 it retries once with a
    * freshly minted token, then throws AnalysisAuthError('unauthorized').
    */
   async analyzeMessages(payload: {
     forumId: string;
-    forumTitle: string;
-    forumDescription?: string;
-    forumQuestion?: string;
-    category?: string;
-    messages: any[];
+    /** Skip the cache; the server allows this for the forum creator or an admin only. */
+    forceRegenerate?: boolean;
   }): Promise<MessageAnalysisResponse> {
     const send = async (forceRefresh: boolean) =>
       fetch('/api/analyzeMessages', {
@@ -71,7 +69,8 @@ export class AnalysisService {
     if (response.status === 401) throw new AnalysisAuthError('unauthorized');
 
     if (!response.ok) {
-      throw new Error('Failed to analyze messages');
+      // Status only (e.g. 403, 404, 422, 503) for diagnostics; no response body
+      throw Object.assign(new Error('Failed to analyze messages'), { status: response.status });
     }
 
     return await response.json();
