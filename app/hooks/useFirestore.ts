@@ -12,6 +12,7 @@ import {
 import { useCallback, useEffect, useState } from 'react';
 // @ts-ignore
 import { db } from '../firebase';
+import { errorCode } from '../firebase/error-code';
 import {
   PublishError,
   publishComment,
@@ -64,15 +65,12 @@ export interface Vote {
 }
 
 /** A safe error category for logs: a Firebase or publish code, never a message or payload. */
-export function errorCode(error: unknown): string {
-  if (error instanceof PublishError) return `publish/${error.kind}${error.status ? `-${error.status}` : ''}`;
-  const code = (error as { code?: unknown } | null)?.code;
-  return typeof code === 'string' && /^[a-z-]+(\/[a-z0-9-]{1,64})?$/.test(code) ? code : 'unknown';
-}
+const errorCategory = (error: unknown): string =>
+  error instanceof PublishError ? `publish/${error.kind}${error.status ? `-${error.status}` : ''}` : errorCode(error);
 
 /** Structured browser diagnostics: operation, safe IDs, counts, codes. No content. */
 export function logFirestoreError(operation: string, error: unknown, fields: Record<string, unknown> = {}) {
-  console.error(`[${operation}] failed`, { ...fields, code: errorCode(error) });
+  console.error(`[${operation}] failed`, { ...fields, code: errorCategory(error) });
 }
 
 export function useFirestore() {

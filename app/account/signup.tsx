@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import { Footer } from '~/components/footer/footer';
 import { clearLegacyRoleFlags, hasAdminClaim } from "../auth/admin-claim";
 import { firebaseAuth } from "../firebase";
+import { errorCode } from "../firebase/error-code";
 
 export const SignUpPage: React.FC = () => {
   const [displayName, setDisplayName] = useState<string>('');
@@ -32,7 +33,7 @@ export const SignUpPage: React.FC = () => {
 
     } catch (err: any) {
       setError(err.message);
-      console.error('Sign-up error:', err);
+      console.error('[signup] failed', { code: errorCode(err) });
     }
   };
 

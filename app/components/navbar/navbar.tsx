@@ -16,7 +16,6 @@ export function NavBar() {
           const savedAnonymous = window.sessionStorage.getItem("anonymous");
           if (savedAnonymous !== null) {
             setAnonymous(savedAnonymous);
-            console.log("Anonymous User: " + savedAnonymous);
           }
         }
       } else {

@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import { Footer } from "../components/footer/footer";
 import { clearLegacyRoleFlags, hasAdminClaim } from "../auth/admin-claim";
 import { firebaseAuth } from "../firebase";
+import { errorCode } from "../firebase/error-code";
 
 export const LoginPage: React.FC = () => {
   const [email, setEmail] = useState<string>("");
@@ -27,7 +28,7 @@ export const LoginPage: React.FC = () => {
 
   } catch (err: any) {
     setError(err.message);
-    console.error("Login error:", err);
+    console.error("[login] failed", { code: errorCode(err) });
   }
 };
     
