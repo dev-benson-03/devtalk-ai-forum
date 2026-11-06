@@ -1,6 +1,7 @@
 import { signInWithEmailAndPassword } from "firebase/auth";
 import React, { useState } from 'react';
 import { Footer } from "../components/footer/footer";
+import { clearLegacyRoleFlags, hasAdminClaim } from "../auth/admin-claim";
 import { firebaseAuth } from "../firebase";
 
 export const LoginPage: React.FC = () => {
@@ -16,22 +17,12 @@ export const LoginPage: React.FC = () => {
     const userCredential = await signInWithEmailAndPassword(firebaseAuth, email, password);
     const user = userCredential.user;
 
-    const adminUID = "g0035irux7MA70QfUOi3xb57bmg1";
+    // Admin comes only from the verified custom claim (fresh token), never a UID
+    const isAdmin = await hasAdminClaim(user, true);
+    clearLegacyRoleFlags(sessionStorage);
+    sessionStorage.setItem("anonymous", "false");
+    alert(isAdmin ? "Admin logged in!" : "User logged in!");
 
-    if (user.uid === adminUID) {
-      // Admin user
-      sessionStorage.setItem("role", "admin");
-      sessionStorage.setItem("admin", "true");
-      sessionStorage.setItem("anonymous", "false");
-      alert("Admin logged in!");
-    } else {
-      // Regular signed-in user
-      sessionStorage.setItem("role", "user");
-      sessionStorage.setItem("admin", "false");
-      sessionStorage.setItem("anonymous", "false");
-      alert("User logged in!");
-    }
-          
     window.location.href = '/';
 
   } catch (err: any) {

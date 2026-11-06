@@ -1,17 +1,17 @@
-import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { onIdTokenChanged, signOut } from 'firebase/auth';
 import React, { useEffect, useState } from 'react';
 import { Footer } from '~/components/footer/footer';
 import { NavBar } from '~/components/navbar/navbar';
+import { hasAdminClaim } from '../auth/admin-claim';
 import { firebaseAuth } from '../firebase';
 
 export const UserDashboardPage: React.FC = () => {
-  // useState with a boolean type explicitly defined for isAdmin
-  const [isAdmin, setAdmin] = useState<string>("");
+  // Admin view only for a verified `admin` custom claim on the ID token
+  const [isAdmin, setAdmin] = useState<boolean>(false);
   const [isAnonymous, setAnonymous] = useState<string>("");
-  const [role, setRole] = useState<string | null>(null);
   const [user, setCurrentUser] = useState<any>(null);
 
-  // Function to toggle the user role
+  // Function to toggle the anonymous display preference (not an authorization setting)
   const toggleUserSetting = () => {
     if(isAnonymous === "false") {
       sessionStorage.setItem("anonymous", "true");
@@ -24,35 +24,35 @@ export const UserDashboardPage: React.FC = () => {
     }
     
   };
-      useEffect(() => {
-    const storedRole = sessionStorage.getItem("role");
-    setRole(storedRole);
-  }, []);
-  
-  
+
+  // Follows sign-in, sign-out and token refreshes, so a granted or revoked
+  // claim shows up once the token is refreshed
   useEffect(() => {
-      const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+      let current = true;
+      const unsubscribe = onIdTokenChanged(firebaseAuth, (user) => {
       setCurrentUser(user);
       if (!user) {
+          setAdmin(false);
           // User is redirected to login page
           window.location.href = '/login';
+          return;
       }
+      hasAdminClaim(user).then((admin) => {
+          if (current) setAdmin(admin);
       });
-      return () => unsubscribe();
+      });
+      return () => {
+          current = false;
+          unsubscribe();
+      };
   }, []);
 
-    // Load from sessionStorage on component mount (client-side only)
+    // Load the display preference from sessionStorage (client-side only)
     useEffect(() => {
       if (typeof window !== "undefined") {
         const savedAnonymous = window.sessionStorage.getItem("anonymous");
-        const savedAdmin = window.sessionStorage.getItem("admin");
         if (savedAnonymous !== null) {
           setAnonymous(savedAnonymous);
-          console.log("Anonymous User: " + isAnonymous);
-        }
-        if (savedAdmin !== null) {
-          setAdmin(savedAdmin);
-          console.log("Admin User: " + isAdmin);
         }
       }
     }, );
@@ -71,7 +71,7 @@ export const UserDashboardPage: React.FC = () => {
         <div className="bg-white shadow-lg rounded-lg p-10 w-full max-w-md">
           <h1 className="text-3xl font-bold mb-6 text-center text-gray-800">User Settings</h1>
           {/* Conditionally render content based on isAdmin state */}
-          {isAdmin === "true" ? (
+          {isAdmin ? (
             <div className="text-center">
               <h2 className="text-2xl font-semibold mb-2 text-[#F47D26]">Admin View</h2>
               <p className="text-gray-700 mb-4">You can edit or delete.</p>

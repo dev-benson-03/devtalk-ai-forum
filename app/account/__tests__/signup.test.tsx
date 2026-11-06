@@ -7,12 +7,13 @@ jest.mock('firebase/auth', () => ({
   createUserWithEmailAndPassword: jest.fn(),
   signInWithEmailAndPassword: jest.fn(),
   updateProfile: jest.fn(),
+  getIdTokenResult: jest.fn(async () => ({ claims: {} })),
     getAuth: jest.fn(() => ({})), // Add this line
 }));
 window.alert = jest.fn();
 const mockSetItem = jest.fn();
 Object.defineProperty(window, 'sessionStorage', {
-  value: { setItem: mockSetItem, getItem: jest.fn(() => 'user') },
+  value: { setItem: mockSetItem, getItem: jest.fn(() => 'user'), removeItem: jest.fn() },
   writable: true,
 });
 
@@ -25,7 +26,7 @@ describe('SignUpPage', () => {
     expect(screen.getByRole('button', { name: /sign up/i })).toBeInTheDocument();
   });
 
-  test('handles successful sign up as admin', async () => {
+  test('never treats the old hardcoded admin UID as an admin', async () => {
     const { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile } = require('firebase/auth');
     createUserWithEmailAndPassword.mockResolvedValue({});
     signInWithEmailAndPassword.mockResolvedValue({ user: { uid: 'g0035irux7MA70QfUOi3xb57bmg1' } });
@@ -36,9 +37,10 @@ describe('SignUpPage', () => {
     fireEvent.change(screen.getByLabelText(/username/i), { target: { value: 'Admin' } });
     fireEvent.click(screen.getByRole('button', { name: /sign up/i }));
     await waitFor(() => {
-      expect(mockSetItem).toHaveBeenCalledWith('role', 'admin');
-      expect(window.alert).toHaveBeenCalledWith(expect.stringMatching(/admin logged in/i));
+      expect(window.alert).toHaveBeenCalledWith(expect.stringMatching(/user logged in/i));
     });
+    expect(mockSetItem).not.toHaveBeenCalledWith('role', expect.anything());
+    expect(mockSetItem).not.toHaveBeenCalledWith('admin', expect.anything());
   });
 
   test('handles successful sign up as regular user', async () => {
@@ -52,7 +54,7 @@ describe('SignUpPage', () => {
     fireEvent.change(screen.getByLabelText(/username/i), { target: { value: 'User' } });
     fireEvent.click(screen.getByRole('button', { name: /sign up/i }));
     await waitFor(() => {
-      expect(mockSetItem).toHaveBeenCalledWith('role', 'user');
+      expect(mockSetItem).toHaveBeenCalledWith('anonymous', 'false');
       expect(window.alert).toHaveBeenCalledWith(expect.stringMatching(/user logged in/i));
     });
   });
