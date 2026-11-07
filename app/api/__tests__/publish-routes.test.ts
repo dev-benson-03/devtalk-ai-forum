@@ -9,6 +9,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { FakeFirestore } from "../__fixtures__/fake-firestore";
 import { MODERATION_POLICY_VERSION } from "../../moderation/policy.server";
 import { RECEIPT_COLLECTION } from "../publish.server";
+import { PUBLISH_LIMITS, PUBLISH_LIMIT_COLLECTION } from "../publish-limits.server";
 
 process.env.OPENAI_API_KEY = "test-key";
 
@@ -88,6 +89,9 @@ const commentBody = (fields: Record<string, unknown> = {}) => ({
 
 const hoursFromNow = (h: number) => Timestamp.fromMillis(Date.now() + h * 3_600_000);
 const baseForum = { title: "T", creatorId: "owner", isActive: true, isAdminDeleted: false, commentCount: 0 };
+
+/** Writes other than the publishing allowance (which counts every admitted attempt). */
+const contentWrites = () => mockDb.writes.filter((w) => w.collection !== PUBLISH_LIMIT_COLLECTION);
 
 const docsIn = (collection: string) =>
   [...mockDb.docs.entries()].filter(([path]) => path.startsWith(`${collection}/`)).map(([, data]) => data);
@@ -238,7 +242,7 @@ describe("publishing routes", () => {
       const res = await createForum(post("/api/forums", forumBody({ description: PRIVATE_TEXT })));
       expect(res.status).toBe(422);
       expect(await res.json()).toEqual({ error: "Content not allowed", reason: "sexual", field: "description" });
-      expect(mockDb.writes).toHaveLength(0);
+      expect(contentWrites()).toHaveLength(0); // the admitted attempt is still counted
     });
 
     it("rejects strong profanity in the title and writes nothing", async () => {
@@ -284,7 +288,7 @@ describe("publishing routes", () => {
         expect(res.headers.get("Retry-After")).toBe("30");
         expect(await res.json()).toEqual({ error: "Publishing unavailable", reason: "moderation_unavailable" });
       }
-      expect(mockDb.writes).toHaveLength(0);
+      expect(contentWrites()).toHaveLength(0); // the admitted attempt is still counted
     });
 
     it("when no OpenAI key is configured", async () => {
@@ -295,7 +299,7 @@ describe("publishing routes", () => {
       } finally {
         process.env.OPENAI_API_KEY = key;
       }
-      expect(mockDb.writes).toHaveLength(0);
+      expect(contentWrites()).toHaveLength(0); // the admitted attempt is still counted
     });
   });
 
@@ -339,7 +343,7 @@ describe("publishing routes", () => {
       const res = await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
       expect(res.status).toBe(422);
       expect(await res.json()).toEqual({ error: "Content not allowed", reason: "self_harm", field: "content", support: true });
-      expect(mockDb.writes).toHaveLength(0);
+      expect(contentWrites()).toHaveLength(0); // the admitted attempt is still counted
       expect(loggedText()).not.toContain("support");
     });
 
@@ -389,7 +393,7 @@ describe("publishing routes", () => {
       const res = await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
       expect(res.status).toBe(422);
       expect(await res.json()).toEqual({ error: "Content not allowed", reason, field: "content" });
-      expect(mockDb.writes).toHaveLength(0);
+      expect(contentWrites()).toHaveLength(0); // the admitted attempt is still counted
     });
 
     it("accepts benign educational terminology", async () => {
@@ -479,6 +483,118 @@ describe("publishing routes", () => {
       expect((await createComment(post("/api/comments", commentBody({ requestId: OTHER_REQUEST_ID })))).status).toBe(500);
       expect(docsIn("comments")).toHaveLength(0);
       expect(mockDb.read("forums", "open")!.commentCount).toBe(0);
+    });
+  });
+
+  describe("publishing rate limits", () => {
+    /** Uses up a user's allowance for one window, as if `count` attempts were just admitted. */
+    const exhaust = (field: "forums" | "comments" | "daily", uid = "dana", count?: number) => {
+      const max = count ?? PUBLISH_LIMITS[field].max;
+      mockDb.seed(PUBLISH_LIMIT_COLLECTION, uid, {
+        ...mockDb.read(PUBLISH_LIMIT_COLLECTION, uid),
+        [field]: { start: Timestamp.fromMillis(Date.now() - 1_000), count: max },
+      });
+    };
+    const used = (field: "forums" | "comments" | "daily", uid = "dana") =>
+      (mockDb.read(PUBLISH_LIMIT_COLLECTION, uid)?.[field] as { count?: number } | undefined)?.count ?? 0;
+
+    it("counts each admitted forum and comment against the verified user", async () => {
+      expect((await createForum(post("/api/forums", forumBody()))).status).toBe(201);
+      expect((await createComment(post("/api/comments", commentBody({ requestId: OTHER_REQUEST_ID })))).status).toBe(201);
+      expect([used("forums"), used("comments"), used("daily")]).toEqual([1, 1, 2]);
+      expect(mockDb.read(PUBLISH_LIMIT_COLLECTION, "alice")).toBeUndefined();
+    });
+
+    it.each([
+      ["forum", "forums", () => createForum(post("/api/forums", forumBody({ description: PRIVATE_TEXT })))],
+      ["comment", "comments", () => createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })))],
+      ["forum (daily cap)", "daily", () => createForum(post("/api/forums", forumBody({ description: PRIVATE_TEXT })))],
+    ] as const)("returns 429 for a %s over the limit, without moderation or writes", async (_label, field, call) => {
+      exhaust(field);
+      const res = await call();
+      expect(res.status).toBe(429);
+      const body = await res.json();
+      expect(body).toEqual({ error: "Too many requests", reason: "rate_limited", retryAfterSeconds: expect.any(Number) });
+      expect(body.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+      expect(body.retryAfterSeconds).toBeLessThanOrEqual(PUBLISH_LIMITS[field].windowMs / 1000);
+      expect(res.headers.get("Retry-After")).toBe(String(body.retryAfterSeconds));
+      expect(mockModerate).not.toHaveBeenCalled();
+      expect(contentWrites()).toHaveLength(0);
+      expect(loggedText()).toContain("rate_limited");
+    });
+
+    it("lets a user who hit the forum limit still comment, and other users still post", async () => {
+      exhaust("forums");
+      expect((await createComment(post("/api/comments", commentBody()))).status).toBe(201);
+      signedIn("erin");
+      expect((await createForum(post("/api/forums", forumBody({ requestId: OTHER_REQUEST_ID })))).status).toBe(201);
+    });
+
+    it("fails closed with 503 when quota storage is unavailable, without moderation or writes", async () => {
+      mockDb.failures.set(PUBLISH_LIMIT_COLLECTION, Object.assign(new Error("UNAVAILABLE: quota"), { code: 14 }));
+      for (const res of [
+        await createForum(post("/api/forums", forumBody({ description: PRIVATE_TEXT }))),
+        await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT }))),
+      ]) {
+        expect(res.status).toBe(503);
+        expect(res.headers.get("Retry-After")).toBe("30");
+        expect(await res.json()).toEqual({ error: "Publishing unavailable", reason: "rate_limit_unavailable" });
+      }
+      expect(mockModerate).not.toHaveBeenCalled();
+      expect(mockDb.writes).toHaveLength(0);
+      expect(loggedText()).toContain("rate_limit_unavailable");
+      expect(loggedText()).not.toContain("UNAVAILABLE: quota");
+    });
+
+    it("counts attempts that moderation rejects, so rejected content can't be resent without limit", async () => {
+      moderationSays({ [PRIVATE_TEXT]: { harassment: true } });
+      exhaust("comments", "dana", PUBLISH_LIMITS.comments.max - 1);
+      const send = () => createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
+      expect((await send()).status).toBe(422);
+      expect((await send()).status).toBe(429);
+      expect(mockModerate).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts attempts that fail because moderation is unavailable", async () => {
+      mockModerate.mockRejectedValue(new Error("upstream 500"));
+      exhaust("forums", "dana", PUBLISH_LIMITS.forums.max - 1);
+      expect((await createForum(post("/api/forums", forumBody()))).status).toBe(503);
+      expect((await createForum(post("/api/forums", forumBody()))).status).toBe(429);
+    });
+
+    it("returns a completed identical retry without moderation or new allowance, even at the limit", async () => {
+      const first = await (await createComment(post("/api/comments", commentBody()))).json();
+      exhaust("comments");
+      exhaust("daily");
+      mockModerate.mockClear();
+      const again = await createComment(post("/api/comments", commentBody()));
+      expect(again.status).toBe(200);
+      expect(await again.json()).toEqual({ id: first.id, duplicate: true });
+      expect(mockModerate).not.toHaveBeenCalled();
+      expect(used("comments")).toBe(PUBLISH_LIMITS.comments.max);
+    });
+
+    it("still returns 409 request_reused for a changed submission at the limit", async () => {
+      await createComment(post("/api/comments", commentBody()));
+      exhaust("comments");
+      const res = await createComment(post("/api/comments", commentBody({ content: "Edited after a lost response" })));
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ reason: "request_reused" });
+    });
+
+    it("checks the forum before using allowance", async () => {
+      for (const forumId of ["closed", "deleted", "missing"]) {
+        expect((await createComment(post("/api/comments", commentBody({ forumId })))).status).not.toBe(201);
+      }
+      expect(mockDb.read(PUBLISH_LIMIT_COLLECTION, "dana")).toBeUndefined();
+    });
+
+    it("uses no allowance and no moderation for unauthenticated or malformed requests", async () => {
+      await createForum(post("/api/forums", forumBody(), null));
+      await createForum(post("/api/forums", "{not json"));
+      await createComment(post("/api/comments", commentBody({ userId: "alice" })));
+      expect(mockDb.writes).toHaveLength(0);
+      expect(mockModerate).not.toHaveBeenCalled();
     });
   });
 });
