@@ -129,5 +129,9 @@ service cloud.firestore {
     match /publishRequests/{docId} {
       allow read, write: if false;
     }
+    // Per-user publishing allowance (counters only), keyed by UID
+    match /publishRateLimits/{docId} {
+      allow read, write: if false;
+    }
   }
 }
