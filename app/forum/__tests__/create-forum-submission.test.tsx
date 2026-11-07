@@ -74,6 +74,24 @@ describe("CreateForumPage - Form Submission", () => {
     });
   });
 
+  it("keeps the draft and its request ID after a rate limit, without retrying by itself", async () => {
+    const { PublishError } = jest.requireActual("../publish-client");
+    mockCreateForum
+      .mockRejectedValueOnce(new PublishError("rate_limited", 429, "rate_limited", undefined, false, 1800))
+      .mockResolvedValueOnce({ id: "f1" });
+    render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(expect.stringMatching(/try again in about 30 minutes/)));
+    expect(mockCreateForum).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText(/forum title/i)).toHaveValue("Test Forum");
+
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(mockCreateForum).toHaveBeenCalledTimes(2));
+    const [first, second] = mockCreateForum.mock.calls.map(([arg]) => arg.requestId);
+    expect(second).toBe(first);
+  });
+
   it("shows the support message only when the server asks for it", async () => {
     const { SUPPORT_MESSAGE } = jest.requireActual("../publish-client");
     mockCreateForum.mockResolvedValueOnce({ id: "f1", support: true });
