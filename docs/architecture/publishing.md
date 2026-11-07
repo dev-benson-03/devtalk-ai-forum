@@ -31,8 +31,9 @@ create-forum.tsx / forum-detail.tsx
                     a. duplicate check: publishRequests/{sha256(uid, requestId)},
                        digest of the submission must match (else 409)
                     b. (comments) forum exists, is visible, accepts comments (404 / 403 / 409)
-                    c. moderation: profanity check and OpenAI Moderation (422 / 503)
-                    d. one Admin SDK transaction: re-check (a) and (b), then
+                    c. admission: publishRateLimits/{uid}, own transaction (429 / 503)
+                    d. moderation: profanity check and OpenAI Moderation (422 / 503)
+                    e. one Admin SDK transaction: re-check (a) and (b), then
                        create the document + receipt (+ commentCount for comments)
 ```
 
@@ -131,6 +132,65 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
 - **No receipt on failure:** a rejected or failed submission writes no
   receipt, so the same draft can be fixed and resent with the same ID.
 
+### Publishing limits
+
+Each verified user has a publishing allowance (`app/api/publish-limits.server.ts`),
+checked after authentication, validation, the receipt check and (comments)
+the forum checks, and before moderation. Starting values, not measured
+thresholds:
+
+| Window | Limit per user |
+| --- | --- |
+| New forums | 5 per hour |
+| New comments | 30 per 10 minutes |
+| Forums and comments together | 200 per UTC day (resets at 00:00:00 UTC) |
+
+- **Algorithm:** fixed windows. The forum and comment windows start at the
+  first admitted attempt and reset once their time has passed. The daily
+  window is the UTC calendar day: it resets at 00:00:00 UTC (the last moment
+  of a day is 23:59:59.999). UTC avoids time zones and daylight saving; for
+  U.S. users the reset falls in the evening local time.
+- **Date handling:** all times are integer milliseconds since 1970 in UTC and
+  are stored as Firestore Timestamps. There are no two-digit years, date
+  strings or local-time conversions. Tests cover the 2000 rollover, a leap day,
+  the 2038 32-bit limit and 2100 (not a leap year). A clock outside the range
+  Firestore can store (after the year 9999) gives a 503, not a crash. The forum and comment windows
+  are independent, so hitting the forum limit doesn't stop someone replying.
+  The daily window caps one account at 200 admitted attempts a day. That is
+  not a guarantee of 200 provider calls: the moderation SDK retries a failed
+  request, so one attempt can make more than one call. At a window boundary a user can briefly get up to twice a short
+  limit; that is accepted for simplicity.
+- **Storage:** `publishRateLimits/{uid}` holds only
+  `{ forums, comments, daily: { start, count }, expireAt }`. `expireAt` is
+  the latest end of every window the document holds, including the one the
+  current attempt didn't touch, because a short window can run past the end
+  of the daily one. No text, email,
+  token, score or support flag. Browsers can't read or write it (rules).
+- **Atomic:** the check and the count happen in one Firestore transaction
+  with no external call inside it, so concurrent requests can't exceed the
+  limit (emulator tests). It is separate from the final write transaction.
+- **What counts:** every admitted attempt, including ones moderation
+  rejects, ones that fail because moderation is down, and ones whose final
+  write fails. Otherwise rejected content could be resent without limit.
+- **What doesn't count:** unauthenticated or malformed requests, a completed
+  identical retry (it returns the original ID from the receipt), a changed
+  submission under a used ID (409), and comments refused by the forum checks.
+  Concurrent new requests with the same ID that have no receipt yet may each
+  count and each be moderated; only one is published.
+- **Clocks:** a window that starts slightly after this request's clock
+  (another instance's clock or a request that read it later) is treated as
+  current, not expired. The emulator showed that resetting it lost counts.
+- **Contention:** if many requests from one user collide, a transaction can
+  give up (Firestore `ABORTED`). That returns 503, never an admission.
+- **Separate from AI analysis:** these limits don't touch
+  `analysisRateLimits` and vice versa.
+
+Database operations for a new submission: 1 receipt read, 1 forum read
+(comments), the admission transaction (1 read, 1 write), then the existing
+write transaction. A completed duplicate costs 1 read. A refused one costs
+the receipt read, the forum read (comments) and 1 read in the admission
+transaction.
+
 ## How bypass attempts are prevented
 
 | Attempt | Blocked by |
@@ -141,6 +201,8 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
 | Post as someone else or as an admin | The server takes the UID from the verified token, and unknown body keys get a 400 |
 | Skip moderation through the API | The endpoints always moderate before writing. The Admin SDK bypasses rules, so the endpoints validate everything themselves |
 | Moderation outage | Fail closed: 503 and no write |
+| Flood moderation with submissions, or resend rejected content | Per-user publishing limits, counted before moderation (429) |
+| Read or reset one's own allowance | Rules: `publishRateLimits` is denied to every browser, admins included (tests) |
 | Read the publish receipts | Rules: `publishRequests` is denied to every browser (tests) |
 | Comment on a closed or hidden forum | Server checks before moderation and again inside the transaction |
 | Steer What's Tea with a comment | See `ai-analysis.md`: the prompt treats forum text as quoted data, and the output is validated |
@@ -154,6 +216,8 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
 | Reused request ID | 409 | `{ reason: "request_reused" }` | Generic failure alert; the draft gets a new ID, so sending again works |
 | Moderation down | 503 + `Retry-After: 30` | `{ reason: "moderation_unavailable" }` | Alert: "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment." The button is enabled again. |
 | Storage down | 503 + `Retry-After: 5` | `{ reason: "storage_unavailable" }` | Same as above |
+| Over the publishing limit | 429 + `Retry-After: n` | `{ reason: "rate_limited", retryAfterSeconds: n }` | Alert: "You're posting faster than DevTalk allows. Your draft is still here, so please try again in about *n minutes*." The draft and its request ID stay. |
+| Limit storage down | 503 + `Retry-After: 30` | `{ reason: "rate_limit_unavailable" }` | Same as "Moderation down" |
 | Forum closed | 409 | `{ reason: "forum_closed" }` | Alert: the forum has closed. The draft stays. |
 | Hidden or deleted forum | 403 | `{ error }` | Generic failure alert |
 | Signed out or expired token | 401 | `{ error }` | One retry with a fresh token, then "Please sign in again to post." |
@@ -169,7 +233,8 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
 ## Logging
 
 - **Server** (`[publish]`): event name, forum ID, published ID, status,
-  reason code, field name, error code and duration.
+  reason code, field name, error code, `retryAfterSeconds` (rate limits)
+  and duration. The UID is not logged.
 - **Never logged:** submitted text, display names, emails, tokens or
   moderation scores. The route tests assert this.
 - **Browser** (`useFirestore`, login, signup): operation, IDs, counts,
@@ -185,9 +250,13 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
    The new rules deny the old browser create paths. Until the rules are
    deployed, the console's deny-all rules still block all browser reads,
    so forum pages stay blocked.
-4. **Receipt cleanup (optional):** a Firestore TTL policy on
-   `publishRequests.expiresAt` (7 days). It is free and needs no new
-   infrastructure.
+4. **Cleanup (optional):** Firestore TTL policies on
+   `publishRequests.expiresAt` (7 days) and `publishRateLimits.expireAt`
+   (the latest end of the user's stored windows). They need no new
+   infrastructure, but each TTL deletion is a billable Firestore delete
+   operation. Without them, each limit document stays (one small
+   document per user who has posted); a stale one is simply treated as
+   expired. Not configured here.
 5. **Index:** no composite index is needed. The publish code reads by
    document ID only.
 
@@ -197,6 +266,8 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
   (no live calls). The provider's response shape matches the openai
   6.6.0 SDK types and is validated at runtime.
 - **Production Firestore:** contention behavior was tested only in the
-  emulator.
+  emulator, including the publishing limits.
+- **Limit values:** chosen as starting points for a small forum, not
+  measured against real traffic.
 - **Browser smoke test:** none was run in a real browser against a deployed
   server.

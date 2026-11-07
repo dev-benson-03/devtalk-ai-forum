@@ -27,7 +27,7 @@ rules (`app/api/analyzeMessages.ts`, `app/api/publish.server.ts`).
 | `comments` | create | **nobody in the browser.** The server publishes through `POST /api/comments`, with `commentCount` in the same transaction | — | — |
 | `comments` | update | nobody (no edit feature) | — | — |
 | `comments` | delete | admins only | — | — |
-| `analysisCache`, `analysisState`, `analysisRateLimits`, `publishRequests` | any | nobody in the browser (Admin SDK only) | — | — |
+| `analysisCache`, `analysisState`, `analysisRateLimits`, `publishRequests`, `publishRateLimits` | any | nobody in the browser (Admin SDK only) | — | — |
 | anything else | any | nobody | — | — |
 
 No other collection is used by the browser. The `Vote` type in
