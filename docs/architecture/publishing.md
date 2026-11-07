@@ -26,14 +26,35 @@ create-forum.tsx / forum-detail.tsx
             (Bearer ID token, JSON body, one requestId per draft)
             └─ publish-route.server.ts
                  1. requireUser: verified token (401 / 503)
-                 2. readJsonBody + validate*Request (400 / 413)
+                 2. readJsonBody (stream-bounded, 32 KiB) + validate*Request (400 / 413)
                  3. publish.server.ts
-                    a. duplicate check: publishRequests/{sha256(uid, requestId)}
+                    a. duplicate check: publishRequests/{sha256(uid, requestId)},
+                       digest of the submission must match (else 409)
                     b. (comments) forum exists, is visible, accepts comments (404 / 403 / 409)
-                    c. moderation: profanity check, then OpenAI Moderation (422 / 503)
+                    c. moderation: profanity check and OpenAI Moderation (422 / 503)
                     d. one Admin SDK transaction: re-check (a) and (b), then
                        create the document + receipt (+ commentCount for comments)
 ```
+
+### Reading the body
+
+The body is read by `readBoundedText` (`app/api/bounded-body.ts`) before any
+JSON parsing:
+
+- **Declared size:** a `Content-Length` above 32 KiB
+  (`MAX_PUBLISH_BODY_BYTES`) gets 413 at once, and the body is cancelled
+  unread.
+- **Actual size:** the stream is read chunk by chunk and its bytes are
+  counted. As soon as the count passes 32 KiB the reader is cancelled (web
+  streams) or destroyed (Node streams) and the request gets 413. A missing
+  or false `Content-Length` doesn't matter. Oversized text is never decoded
+  or parsed.
+- **Encoding:** the bytes must be valid UTF-8 (`TextDecoder` with
+  `fatal: true`). Invalid UTF-8 or JSON gets 400 `invalid_json`; a stream
+  that fails mid-read gets 400 `unreadable_body`.
+- **Nothing else runs:** after a 400 or 413 there is no moderation call and
+  no Firestore access. Authentication runs first, so an unauthenticated
+  request is rejected before its body is read.
 
 ### Request bodies
 
@@ -87,15 +108,28 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
   ID. The ID is replaced only after a successful post.
 - **Receipts:** a successful publish writes a receipt
   `publishRequests/{sha256(uid + requestId)}` (`uid`, `kind`, `targetId`,
-  `expiresAt`) in the same transaction as the document.
-- **Repeats:** a repeat finds the receipt, before moderation or inside the
-  transaction, and returns the original ID with `duplicate: true` (HTTP
-  200). Nothing is written twice. The emulator test sends 4 concurrent
-  requests with one ID and gets 1 comment and a count of 1.
-- **Wrong kind:** a receipt for a forum can't be reused for a comment
-  (409 `request_reused`).
+  `digest`, `expiresAt`) in the same transaction as the document.
+- **Digest:** `digest` is the SHA-256 of a JSON array (a fixed, ordered
+  encoding) of a version tag, the operation, the verified UID and the
+  validated fields (`forumDigest` and `commentDigest` in `publish.server.ts`):
+  - forum: title, description, question, category, timeLimitHours, anonymous;
+  - comment: forumId, content, anonymous.
+
+  The text is trimmed by validation first, so whitespace changes don't count.
+  The receipt stores only the hash, never the text.
+- **Repeats:** a repeat with the same digest finds the receipt and returns the
+  original ID with `duplicate: true` (HTTP 200). Nothing is written twice. The
+  emulator test sends 4 concurrent requests with one ID and gets 1 comment and
+  a count of 1.
+- **Changed submission:** the same `requestId` with any different field, a
+  different user or a different operation gets 409 `request_reused`, before
+  moderation and with no write. The page then starts a new `requestId` for the
+  draft, so pressing Send again publishes the edited text.
+- **Checked twice:** the digest is compared before moderation and again inside
+  the transaction, so two different submissions racing with one ID publish
+  exactly one (emulator tests).
 - **No receipt on failure:** a rejected or failed submission writes no
-  receipt, so the same draft can be fixed and resent.
+  receipt, so the same draft can be fixed and resent with the same ID.
 
 ## How bypass attempts are prevented
 
@@ -115,8 +149,9 @@ example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
 
 | Case | HTTP | Body | What the page does |
 | --- | --- | --- | --- |
-| Published | 201 (repeat: 200) | `{ id, duplicate }` | Forum: goes to `/forums`. Comment: clears the box. |
-| Not allowed | 422 | `{ error, reason, field }` | Alert: "Your *field* doesn't meet DevTalk's community guidelines (*reason*). Please revise it and try again." The draft stays. |
+| Published | 201 (repeat: 200) | `{ id, duplicate, support? }` | Forum: goes to `/forums`. Comment: clears the box. With `support: true`, the author first sees the support message (`content-policy.md`). |
+| Not allowed | 422 | `{ error, reason, field, support? }` | Alert: "Your *field* doesn't meet DevTalk's community guidelines (*reason*). Please revise it and try again." With `support: true` the support message follows. The draft stays. |
+| Reused request ID | 409 | `{ reason: "request_reused" }` | Generic failure alert; the draft gets a new ID, so sending again works |
 | Moderation down | 503 + `Retry-After: 30` | `{ reason: "moderation_unavailable" }` | Alert: "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment." The button is enabled again. |
 | Storage down | 503 + `Retry-After: 5` | `{ reason: "storage_unavailable" }` | Same as above |
 | Forum closed | 409 | `{ reason: "forum_closed" }` | Alert: the forum has closed. The draft stays. |
