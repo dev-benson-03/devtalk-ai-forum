@@ -7,6 +7,7 @@
  * set by the server, never taken from the client.
  */
 import { FORUM_CATEGORIES, FORUM_TIME_LIMITS, TEXT_LIMITS } from "../forum/forum-options";
+import { readBoundedText } from "./bounded-body";
 
 export const MAX_PUBLISH_BODY_BYTES = 32 * 1024;
 
@@ -35,6 +36,7 @@ export type InvalidReason =
   | "invalid_json"
   | "invalid_body"
   | "body_too_large"
+  | "unreadable_body"
   | "unexpected_field"
   | "invalid_field";
 
@@ -105,19 +107,18 @@ export function validateCommentRequest(body: unknown): Parsed<CommentRequest> {
   return { ok: true, value: { forumId: body.forumId, content, anonymous: body.anonymous, requestId: body.requestId } };
 }
 
-/** Reads a small JSON body, rejecting oversized or non-JSON bodies. */
+/**
+ * Reads a small JSON body. The byte limit is enforced while the stream is
+ * read (bounded-body.ts); an oversized body is never parsed.
+ */
 export async function readJsonBody(request: Request): Promise<Parsed<unknown>> {
-  const declared = Number(request.headers?.get?.("Content-Length") ?? 0);
-  if (declared > MAX_PUBLISH_BODY_BYTES) return fail("body_too_large", undefined, 413);
-  let raw: string;
-  try {
-    raw = await request.text();
-  } catch {
-    return fail("invalid_json");
+  const read = await readBoundedText(request, MAX_PUBLISH_BODY_BYTES);
+  if (!read.ok) {
+    if (read.reason === "body_too_large") return fail("body_too_large", undefined, 413);
+    return fail(read.reason === "invalid_encoding" ? "invalid_json" : "unreadable_body");
   }
-  if (new TextEncoder().encode(raw).length > MAX_PUBLISH_BODY_BYTES) return fail("body_too_large", undefined, 413);
   try {
-    return { ok: true, value: JSON.parse(raw) };
+    return { ok: true, value: JSON.parse(read.text) };
   } catch {
     return fail("invalid_json");
   }

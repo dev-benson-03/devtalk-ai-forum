@@ -210,6 +210,24 @@ describe("publishing routes", () => {
       expect(await res.json()).toMatchObject({ reason: "invalid_field", field });
     });
 
+    it("returns 413 for a streamed oversized body without Content-Length, before moderation or Firestore", async () => {
+      const { ReadableStream } = require("node:stream/web");
+      const chunk = new TextEncoder().encode("x".repeat(8 * 1024));
+      let pulls = 0;
+      const body = new ReadableStream({
+        pull(controller: { enqueue(c: Uint8Array): void }) {
+          pulls++;
+          controller.enqueue(chunk); // never ends on its own
+        },
+      });
+      const request = { method: "POST", headers: new Headers({ Authorization: `Bearer ${SECRET_TOKEN}` }), body };
+      const res = await createComment(request as unknown as Request);
+      expect(res.status).toBe(413);
+      expect(pulls).toBeLessThan(10);
+      expect(mockModerate).not.toHaveBeenCalled();
+      expect(mockDb.writes).toHaveLength(0);
+    });
+
     it("rejects non-JSON and oversized bodies", async () => {
       expect((await createForum(post("/api/forums", "{not json"))).status).toBe(400);
       expect((await createForum(post("/api/forums", forumBody({ description: "x".repeat(40_000) })))).status).toBe(413);
