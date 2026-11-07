@@ -1,0 +1,167 @@
+# Secure publishing (Phase 3B)
+
+New forums and comments are published only by the server, after
+authentication, validation and Safe-for-Work moderation. Browsers keep
+reading through Firestore, under the rules. Nothing here is deployed.
+
+## Before: browser write paths (audit of `test` at cfff0ec)
+
+| What | Where | How it wrote | Problem |
+| --- | --- | --- | --- |
+| Create forum | `create-forum.tsx` → `buildForumDocument` → `useFirestore().createForum` | `addDoc(forums)` from the browser | Any text reached Firestore. Rules can check shape, not meaning. |
+| Post comment | `forum-detail.tsx` → `useFirestore().createComment` → `createCommentRecord` | Browser transaction: comment `<forumId>_<n+1>` plus `commentCount` | Same problem |
+| Edit forum text | `useFirestore().updateForum` (no UI calls it) | `updateDoc`; rules allowed the creator to change title, description, question and tags | Would bypass moderation once publishing moved to the server |
+| Hide/delete forum | `updateForum` / `deleteForum` (no UI) | Creator `isActive`; admin flags and delete | No text, so no moderation needed |
+| `/messages` page | `MessageService`, `ModerationService` | `fetch('/api/messages')`, `/api/moderation` | Those endpoints don't exist and don't touch Firestore (unused prototype) |
+
+Firestore rules can't judge meaning, so moderation must run on the server
+and the browser create paths must be closed.
+
+## After: the publishing flow
+
+```
+create-forum.tsx / forum-detail.tsx
+  └─ useFirestore().createForum / createComment
+       └─ publish-client.ts: POST /api/forums | /api/comments
+            (Bearer ID token, JSON body, one requestId per draft)
+            └─ publish-route.server.ts
+                 1. requireUser: verified token (401 / 503)
+                 2. readJsonBody + validate*Request (400 / 413)
+                 3. publish.server.ts
+                    a. duplicate check: publishRequests/{sha256(uid, requestId)}
+                    b. (comments) forum exists, is visible, accepts comments (404 / 403 / 409)
+                    c. moderation: profanity check, then OpenAI Moderation (422 / 503)
+                    d. one Admin SDK transaction: re-check (a) and (b), then
+                       create the document + receipt (+ commentCount for comments)
+```
+
+### Request bodies
+
+Only these keys are accepted. Any other key gets `400 unexpected_field`, for
+example `creatorId`, `userId`, `userName`, `isAdmin`, `isActive`,
+`commentCount`, analysis fields or timestamps.
+
+- **`POST /api/forums`:** `{ title, description, question, category, timeLimitHours, anonymous, requestId }`
+  - Text is trimmed and must not be blank.
+  - Length limits: title 200, description 2,000, question 1,000
+    (`app/forum/forum-options.ts`).
+  - `category` must be one of the form's 9 categories.
+  - `timeLimitHours` must be one of the form's 10 options.
+- **`POST /api/comments`:** `{ forumId, content, anonymous, requestId }`
+  - `content` is 1 to 5,000 characters after trimming.
+- **Both:** `anonymous` is a boolean, and `requestId` is a UUID.
+
+### What the server sets
+
+- **Author:** `creatorId` / `userId` is always the verified token's UID.
+- **Display name:** the token's `name`, then `email`, then "User", cut to 256
+  characters. With `anonymous: true` it is "Anonymous User". Anonymity is a
+  display choice, never authorization: the UID is still stored.
+- **Forum fields:** `isActive: true`, `isAdminDeleted: false`,
+  `commentCount: 0`, `endTime` (now + the chosen time limit), `createdAt`
+  (server time), empty analysis fields as before, and `moderationPolicy`.
+- **Comment fields:** `createdAt` (server time), `upvotes: 0`,
+  `downvotes: 0`, `moderationPolicy`. Comments now get random Firestore IDs.
+  The `<forumId>_<n>` IDs were only needed by the browser rules.
+
+### Comments and `commentCount`
+
+- **No transaction during moderation:** moderation runs before the
+  transaction, so no transaction is held open across the OpenAI call.
+- **Re-check inside the transaction:** the transaction reads the forum
+  again and re-checks that it still exists, is visible and accepts
+  comments: active, not admin-deleted, and before `endTime`. A forum closed
+  or deleted while moderation ran gets no comment.
+- **Atomic count:** the comment and `commentCount` (read value + 1) are
+  written in the same transaction. Firestore retries contended
+  transactions, so concurrent comments are counted exactly. The emulator
+  test runs 5 at once.
+- **Legacy forums:** forums without `commentCount` start at 1, and forums
+  without `endTime` stay open, as on the forum page. A string `endTime`
+  counts as closed, as in the rules.
+
+### Duplicate requests
+
+- **One ID per draft:** the page keeps a `requestId` for each draft. A
+  retry, a double submit, or a resend after a lost response uses the same
+  ID. The ID is replaced only after a successful post.
+- **Receipts:** a successful publish writes a receipt
+  `publishRequests/{sha256(uid + requestId)}` (`uid`, `kind`, `targetId`,
+  `expiresAt`) in the same transaction as the document.
+- **Repeats:** a repeat finds the receipt, before moderation or inside the
+  transaction, and returns the original ID with `duplicate: true` (HTTP
+  200). Nothing is written twice. The emulator test sends 4 concurrent
+  requests with one ID and gets 1 comment and a count of 1.
+- **Wrong kind:** a receipt for a forum can't be reused for a comment
+  (409 `request_reused`).
+- **No receipt on failure:** a rejected or failed submission writes no
+  receipt, so the same draft can be fixed and resent.
+
+## How bypass attempts are prevented
+
+| Attempt | Blocked by |
+| --- | --- |
+| Write a forum or comment straight to Firestore (old SDK path, batch, `addDoc`, `setDoc`) | Rules: `allow create: if false` on `forums` and `comments` (emulator tests) |
+| Edit a forum's text from the browser after publishing | Rules: the creator may change only `isActive`; admins only `isActive` and `isAdminDeleted` |
+| Change `commentCount`, ownership, analysis fields or `moderationPolicy` | Rules: no update path allows them (tests) |
+| Post as someone else or as an admin | The server takes the UID from the verified token, and unknown body keys get a 400 |
+| Skip moderation through the API | The endpoints always moderate before writing. The Admin SDK bypasses rules, so the endpoints validate everything themselves |
+| Moderation outage | Fail closed: 503 and no write |
+| Read the publish receipts | Rules: `publishRequests` is denied to every browser (tests) |
+| Comment on a closed or hidden forum | Server checks before moderation and again inside the transaction |
+| Steer What's Tea with a comment | See `ai-analysis.md`: the prompt treats forum text as quoted data, and the output is validated |
+
+## Responses and user experience
+
+| Case | HTTP | Body | What the page does |
+| --- | --- | --- | --- |
+| Published | 201 (repeat: 200) | `{ id, duplicate }` | Forum: goes to `/forums`. Comment: clears the box. |
+| Not allowed | 422 | `{ error, reason, field }` | Alert: "Your *field* doesn't meet DevTalk's community guidelines (*reason*). Please revise it and try again." The draft stays. |
+| Moderation down | 503 + `Retry-After: 30` | `{ reason: "moderation_unavailable" }` | Alert: "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment." The button is enabled again. |
+| Storage down | 503 + `Retry-After: 5` | `{ reason: "storage_unavailable" }` | Same as above |
+| Forum closed | 409 | `{ reason: "forum_closed" }` | Alert: the forum has closed. The draft stays. |
+| Hidden or deleted forum | 403 | `{ error }` | Generic failure alert |
+| Signed out or expired token | 401 | `{ error }` | One retry with a fresh token, then "Please sign in again to post." |
+| Bad input | 400 / 413 | `{ reason, field? }` | Generic failure alert (the form prevents this) |
+
+- **No redesign:** pages use the same `alert()` they used before for
+  errors, with clearer wording.
+- **Unchanged UI:** the forum page, buttons, theme and What's Tea modal
+  are unchanged.
+- **Retries are manual:** the user sends again when ready, and the page
+  does not retry automatically.
+
+## Logging
+
+- **Server** (`[publish]`): event name, forum ID, published ID, status,
+  reason code, field name, error code and duration.
+- **Never logged:** submitted text, display names, emails, tokens or
+  moderation scores. The route tests assert this.
+- **Browser** (`useFirestore`, login, signup): operation, IDs, counts,
+  duration and an error code from `errorCode()`.
+
+## Deployment prerequisites (for a later phase)
+
+1. **API key:** set `OPENAI_API_KEY` on the server. Without it every
+   publish fails closed (503).
+2. **Admin SDK credentials:** these must be configured (Phase 1). The
+   endpoints use the Admin SDK.
+3. **Order of deployment:** deploy this app version first, then the rules.
+   The new rules deny the old browser create paths. Until the rules are
+   deployed, the console's deny-all rules still block all browser reads,
+   so forum pages stay blocked.
+4. **Receipt cleanup (optional):** a Firestore TTL policy on
+   `publishRequests.expiresAt` (7 days). It is free and needs no new
+   infrastructure.
+5. **Index:** no composite index is needed. The publish code reads by
+   document ID only.
+
+## Not tested
+
+- **The real Moderation API:** its decisions on real text were not tested
+  (no live calls). The provider's response shape matches the openai
+  6.6.0 SDK types and is validated at runtime.
+- **Production Firestore:** contention behavior was tested only in the
+  emulator.
+- **Browser smoke test:** none was run in a real browser against a deployed
+  server.
