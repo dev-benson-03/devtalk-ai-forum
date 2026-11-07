@@ -34,12 +34,32 @@ export type PublishErrorKind =
   | "signed_out"
   | "failed";
 
+/** What a successful publish returns. */
+export interface PublishResult {
+  id: string;
+  /** Show the author SUPPORT_MESSAGE (see content-policy.md). */
+  support?: boolean;
+}
+
+/**
+ * Shown only to the author, in their own browser, when moderation reads a
+ * post as a personal self-harm disclosure (or rejects self-harm content).
+ * It promises nothing: no monitoring, review or intervention.
+ */
+export const SUPPORT_MESSAGE =
+  "If you're going through something difficult, support is available. Consider reaching out to someone you trust " +
+  "or a qualified mental health professional. If you're in immediate danger, contact local emergency services or a " +
+  "crisis support service. In the U.S., you can call or text 988 (Suicide & Crisis Lifeline). Elsewhere, " +
+  "findahelpline.com lists services in many countries.";
+
 export class PublishError extends Error {
   constructor(
     readonly kind: PublishErrorKind,
     readonly status?: number,
     readonly reason?: string,
-    readonly field?: string
+    readonly field?: string,
+    /** Show SUPPORT_MESSAGE with the rejection. */
+    readonly support = false
   ) {
     super(`Publish failed: ${kind}`);
     this.name = "PublishError";
@@ -67,7 +87,7 @@ export const prefersAnonymous = (): boolean =>
 
 const textField = (value: unknown) => (typeof value === "string" && /^[a-zA-Z_]{1,32}$/.test(value) ? value : undefined);
 
-async function send(path: string, body: unknown, getUser: () => Promise<User | null>): Promise<{ id: string }> {
+async function send(path: string, body: unknown, getUser: () => Promise<User | null>): Promise<PublishResult> {
   const user = await getUser();
   if (!user) throw new PublishError("signed_out");
   const request = async (forceRefresh: boolean) => {
@@ -92,14 +112,17 @@ async function send(path: string, body: unknown, getUser: () => Promise<User | n
     if (error instanceof PublishError) throw error;
     throw new PublishError("unavailable"); // network error: nothing was confirmed
   }
-  if (response.ok) return (await response.json()) as { id: string };
+  if (response.ok) {
+    const result = (await response.json()) as { id: string; support?: unknown };
+    return { id: result.id, ...(result.support === true ? { support: true } : {}) };
+  }
 
-  const details = (await response.json().catch(() => ({}))) as { reason?: unknown; field?: unknown };
+  const details = (await response.json().catch(() => ({}))) as { reason?: unknown; field?: unknown; support?: unknown };
   const reason = textField(details.reason);
   const field = textField(details.field);
   const status = response.status;
   if (status === 401) throw new PublishError("signed_out", status);
-  if (status === 422) throw new PublishError("rejected", status, reason, field);
+  if (status === 422) throw new PublishError("rejected", status, reason, field, details.support === true);
   if (status === 409 && reason === "forum_closed") throw new PublishError("closed", status, reason);
   if (status === 503) throw new PublishError("unavailable", status, reason);
   throw new PublishError("failed", status, reason, field);
@@ -120,6 +143,7 @@ const FIELD_LABELS: Record<string, string> = {
 
 const REASON_LABELS: Record<string, string> = {
   sexual: "sexual content",
+  self_harm: "content that could encourage self-harm",
   profanity: "strong profanity",
   hate_harassment: "hate or harassment",
   threat: "threatening language",
@@ -138,7 +162,8 @@ export function publishErrorMessage(error: unknown, fallback: string): string {
         error.field === "displayName"
           ? "Please post anonymously or change your display name."
           : "Please revise it and try again.";
-      return `Your ${field} doesn't meet DevTalk's community guidelines${reason ? ` (${reason})` : ""}. ${fix}`;
+      const message = `Your ${field} doesn't meet DevTalk's community guidelines${reason ? ` (${reason})` : ""}. ${fix}`;
+      return error.support ? `${message}\n\n${SUPPORT_MESSAGE}` : message;
     }
     case "unavailable":
       return "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment.";

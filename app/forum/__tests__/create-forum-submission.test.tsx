@@ -74,6 +74,24 @@ describe("CreateForumPage - Form Submission", () => {
     });
   });
 
+  it("shows the support message only when the server asks for it", async () => {
+    const { SUPPORT_MESSAGE } = jest.requireActual("../publish-client");
+    mockCreateForum.mockResolvedValueOnce({ id: "f1", support: true });
+    const { unmount } = render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(SUPPORT_MESSAGE));
+    unmount();
+
+    (global.alert as jest.Mock).mockClear();
+    mockCreateForum.mockResolvedValueOnce({ id: "f2" });
+    render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(mockCreateForum).toHaveBeenCalledTimes(2));
+    expect(global.alert).not.toHaveBeenCalledWith(SUPPORT_MESSAGE);
+  });
+
   it("keeps the draft and the same request ID after a moderation rejection, so a revision can be resubmitted", async () => {
     const { PublishError } = jest.requireActual("../publish-client");
     mockCreateForum.mockRejectedValueOnce(new PublishError("rejected", 422, "profanity", "title")).mockResolvedValueOnce("id");

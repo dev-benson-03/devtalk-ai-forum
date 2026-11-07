@@ -6,7 +6,7 @@ import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
-import { isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
+import { SUPPORT_MESSAGE, isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -53,7 +53,7 @@ export default function ForumDetailPage() {
             draftRequestId.current ??= newRequestId();
             // The server checks the message, sets the author from the signed-in
             // account and saves it with the forum's comment count
-            await createComment({
+            const published = await createComment({
                 forumId: forumId,
                 content: newMessage.trim(),
                 anonymous: prefersAnonymous(),
@@ -62,6 +62,8 @@ export default function ForumDetailPage() {
 
             setNewMessage("");
             draftRequestId.current = null;
+            // Only the author sees this; nothing about it is stored or shown to others
+            if (published?.support) alert(SUPPORT_MESSAGE);
         } catch (error) {
             // The draft stays in the box so it can be revised and resent
             if (isRequestReused(error)) draftRequestId.current = null;

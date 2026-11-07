@@ -52,7 +52,7 @@ describe('useFirestore', () => {
     let hook: any;
     render(<HookTest callback={h => (hook = h)} />);
     const submission = { title: PRIVATE, description: 'd', question: 'q', category: 'Other', timeLimitHours: 1, anonymous: true, requestId: 'r' };
-    expect(await hook.createForum(submission)).toBe('forum123');
+    expect(await hook.createForum(submission)).toEqual({ id: 'forum123' });
     expect(mockPublishForum).toHaveBeenCalledWith(submission);
     expect(require('firebase/firestore').addDoc).not.toHaveBeenCalled();
     expect(JSON.stringify(info.mock.calls)).not.toContain(PRIVATE);
@@ -90,7 +90,7 @@ describe('useFirestore', () => {
     let hook: any;
     render(<HookTest callback={h => (hook = h)} />);
     const comment = { forumId: 'f1', content: 'Hi', anonymous: false, requestId: 'r' };
-    expect(await hook.createComment(comment)).toBe('c9');
+    expect(await hook.createComment(comment)).toEqual({ id: 'c9' });
     expect(mockPublishComment).toHaveBeenCalledWith(comment);
     expect(require('firebase/firestore').runTransaction).not.toHaveBeenCalled();
   });

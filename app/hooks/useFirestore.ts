@@ -19,6 +19,7 @@ import {
   publishForum,
   type CommentSubmission,
   type ForumSubmission,
+  type PublishResult,
 } from '../forum/publish-client';
 import { listedForumsQuery } from './forum-data';
 
@@ -76,12 +77,12 @@ export function logFirestoreError(operation: string, error: unknown, fields: Rec
 export function useFirestore() {
   // Forum operations
   // New forums are published by the server (moderation, then an Admin SDK write)
-  const createForum = async (forum: ForumSubmission): Promise<string> => {
+  const createForum = async (forum: ForumSubmission): Promise<PublishResult> => {
     const started = Date.now();
     try {
-      const { id } = await publishForum(forum);
-      console.info('[createForum] published', { forumId: id, elapsedMs: Date.now() - started });
-      return id;
+      const result = await publishForum(forum);
+      console.info('[createForum] published', { forumId: result.id, elapsedMs: Date.now() - started });
+      return result;
     } catch (error) {
       logFirestoreError('createForum', error, { elapsedMs: Date.now() - started });
       throw error;
@@ -109,11 +110,10 @@ export function useFirestore() {
 
   // Comment operations
   // Comments are published by the server, which also updates commentCount
-  const createComment = async (comment: CommentSubmission): Promise<string> => {
+  const createComment = async (comment: CommentSubmission): Promise<PublishResult> => {
     const started = Date.now();
     try {
-      const { id } = await publishComment(comment);
-      return id;
+      return await publishComment(comment);
     } catch (error) {
       logFirestoreError('createComment', error, { forumId: comment.forumId, elapsedMs: Date.now() - started });
       throw error;

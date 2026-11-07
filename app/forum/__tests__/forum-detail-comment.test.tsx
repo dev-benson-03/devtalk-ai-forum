@@ -2,7 +2,7 @@ import "@testing-library/jest-dom";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import ForumDetailPage from "../forum-detail";
-import { PublishError } from "../publish-client";
+import { PublishError, SUPPORT_MESSAGE } from "../publish-client";
 
 jest.mock("../../components/navbar/navbar", () => ({ NavBar: () => <nav /> }));
 jest.mock("../../components/footer/footer", () => ({ Footer: () => <footer /> }));
@@ -119,5 +119,26 @@ describe("ForumDetailPage comment publishing", () => {
       expect(global.alert).toHaveBeenCalledWith("This forum has closed and no longer accepts new messages.")
     );
     expect(box()).toHaveValue("Late reply");
+  });
+
+  it("shows the support message after publishing a disclosure, and not otherwise", async () => {
+    mockCreateComment.mockResolvedValueOnce({ id: "c1", support: true }).mockResolvedValueOnce({ id: "c2" });
+    renderPage();
+    send("Having a really hard time lately");
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(SUPPORT_MESSAGE));
+    expect(box()).toHaveValue("");
+    (global.alert as jest.Mock).mockClear();
+    send("Thanks everyone");
+    await waitFor(() => expect(mockCreateComment).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(box()).toHaveValue(""));
+    expect(global.alert).not.toHaveBeenCalled();
+  });
+
+  it("adds the support message to a self-harm rejection and keeps the draft", async () => {
+    mockCreateComment.mockRejectedValue(new PublishError("rejected", 422, "self_harm", "content", true));
+    renderPage();
+    send("A draft");
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(expect.stringContaining(SUPPORT_MESSAGE)));
+    expect(box()).toHaveValue("A draft");
   });
 });

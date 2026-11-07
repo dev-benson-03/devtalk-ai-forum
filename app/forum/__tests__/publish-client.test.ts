@@ -1,4 +1,4 @@
-import { PublishError, publishComment, publishErrorMessage, publishForum } from "../publish-client";
+import { PublishError, SUPPORT_MESSAGE, publishComment, publishErrorMessage, publishForum } from "../publish-client";
 
 const TOKEN = "SECRET-ID-TOKEN";
 const user = (getIdToken = jest.fn(async () => TOKEN)) => ({ getIdToken }) as never;
@@ -67,5 +67,32 @@ describe("publish client", () => {
     expect(publishErrorMessage(new Error("internal detail"), "Failed to post message. Please try again.")).toBe(
       "Failed to post message. Please try again."
     );
+  });
+
+  it("passes the support flag through only when the server sets it to true", async () => {
+    fetchMock.mockResolvedValueOnce(respond(201, { id: "c1", support: true }));
+    await expect(publishComment(comment, async () => user())).resolves.toEqual({ id: "c1", support: true });
+    fetchMock.mockResolvedValueOnce(respond(201, { id: "c2", support: "yes" }));
+    await expect(publishComment(comment, async () => user())).resolves.toEqual({ id: "c2" });
+    fetchMock.mockResolvedValueOnce(respond(422, { reason: "self_harm", field: "content", support: true }));
+    const error = await publishComment(comment, async () => user()).catch((e) => e);
+    expect(error).toMatchObject({ kind: "rejected", reason: "self_harm", support: true });
+  });
+
+  it("adds the support message to a rejection only when flagged", () => {
+    expect(publishErrorMessage(new PublishError("rejected", 422, "self_harm", "content", true), "x")).toBe(
+      "Your message doesn't meet DevTalk's community guidelines (content that could encourage self-harm). Please revise it and try again.\n\n" +
+        SUPPORT_MESSAGE
+    );
+    expect(publishErrorMessage(new PublishError("rejected", 422, "hate_harassment", "content"), "x")).not.toContain("988");
+  });
+
+  it("offers resources without promising monitoring, review or intervention", () => {
+    expect(SUPPORT_MESSAGE).toContain("988");
+    expect(SUPPORT_MESSAGE).toContain("In the U.S.");
+    expect(SUPPORT_MESSAGE).toContain("findahelpline.com");
+    for (const promise of [/monitor/i, /moderator/i, /we will/i, /we'll/i, /contact you/i, /reach out to you/i, /notif/i, /review/i, /alert/i, /at risk/i]) {
+      expect(SUPPORT_MESSAGE).not.toMatch(promise);
+    }
   });
 });

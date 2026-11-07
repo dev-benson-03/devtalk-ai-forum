@@ -5,7 +5,7 @@ import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useFirestore } from "../hooks/useFirestore";
 import { FORUM_CATEGORIES, FORUM_TIME_LIMITS } from "./forum-options";
-import { isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
+import { SUPPORT_MESSAGE, isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function CreateForumPage() {
     const { createForum } = useFirestore();
@@ -44,7 +44,7 @@ export default function CreateForumPage() {
             requestId.current ??= newRequestId();
             // The server checks the content, sets the author from the signed-in
             // account and writes the forum
-            await createForum({
+            const published = await createForum({
                 title: formData.title,
                 description: formData.description,
                 question: formData.question,
@@ -53,6 +53,9 @@ export default function CreateForumPage() {
                 anonymous: prefersAnonymous(),
                 requestId: requestId.current,
             });
+
+            // Only the author sees this; nothing about it is stored or shown to others
+            if (published?.support) alert(SUPPORT_MESSAGE);
 
             // Redirect to the forums page after successful creation
             window.location.href = '/forums';
