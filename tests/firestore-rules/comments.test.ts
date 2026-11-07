@@ -1,7 +1,7 @@
 /**
- * comments: reading with the forum page's query, creating through the app's
- * transaction (comment + commentCount), author spoofing, closed and hidden
- * forums, and comment edits/deletes.
+ * comments: reading with the forum page's query, denial of every browser
+ * create (comments are published by the server after moderation), and
+ * comment edits/deletes.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "@jest/globals";
 import { assertFails, assertSucceeds, type RulesTestEnvironment } from "@firebase/rules-unit-testing";
@@ -13,6 +13,7 @@ import {
   getDoc,
   getDocs,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -20,8 +21,6 @@ import {
   writeBatch,
   type Firestore,
 } from "firebase/firestore";
-import { ANONYMOUS_NAME, authorIdentity } from "../../app/forum/author-identity";
-import { createCommentRecord, type NewComment } from "../../app/hooks/forum-data";
 import { contexts, seedForums } from "./fixtures";
 import { asDb, startRulesEnv } from "./setup";
 
@@ -38,15 +37,6 @@ beforeEach(async () => {
   await env.clearFirestore();
   await seedForums(env);
   as = contexts(env);
-});
-
-const bobVisible = authorIdentity({ uid: "bob", displayName: "Bob" }, "false");
-const bobAnonymous = authorIdentity({ uid: "bob", displayName: "Bob" }, "true");
-const comment = (forumId: string, author = bobVisible, content = "Nice thread"): NewComment => ({
-  forumId,
-  userId: author.id,
-  userName: author.name,
-  content,
 });
 
 async function readAs<T>(read: (db: Firestore) => Promise<T>): Promise<T> {
@@ -81,72 +71,39 @@ function batchWrite(db: Firestore, commentId: string, data: Record<string, unkno
   return batch.commit();
 }
 
-describe("creating comments", () => {
-  it("accepts the app's transaction and keeps commentCount in step", async () => {
-    expect(await assertSucceeds(createCommentRecord(as.bob, comment("open")))).toBe("open_1");
-    expect(await assertSucceeds(createCommentRecord(as.alice, comment("open", authorIdentity({ uid: "alice" }, "true"))))).toBe("open_2");
-    expect((await readForum("open")).commentCount).toBe(2);
-    expect(await readComment("open_1")).toMatchObject({ forumId: "open", userId: "bob", userName: "Bob", upvotes: 0 });
+/**
+ * The transaction the forum page ran before Phase 3B: the comment
+ * <forumId>_<n+1> plus the forum's commentCount, written by the browser.
+ */
+function oldBrowserComment(db: Firestore, forumId: string, fields: Record<string, unknown> = {}) {
+  return runTransaction(db, async (tx) => {
+    const forumRef = doc(db, "forums", forumId);
+    const count = Number((await tx.get(forumRef)).data()?.commentCount ?? 0);
+    tx.set(doc(db, "comments", `${forumId}_${count + 1}`), rawComment(forumId, fields));
+    tx.update(forumRef, { commentCount: count + 1 });
   });
+}
 
-  it("lets a user post with the anonymous display name, stored under their own UID", async () => {
-    await assertSucceeds(createCommentRecord(as.bob, comment("open", bobAnonymous)));
-    expect(await readComment("open_1")).toMatchObject({ userId: "bob", userName: ANONYMOUS_NAME });
-  });
-
-  it("keeps two simultaneous comments distinct (the transaction retries)", async () => {
-    const ids = await Promise.all([
-      createCommentRecord(as.bob, comment("open")),
-      createCommentRecord(as.alice, comment("open", authorIdentity({ uid: "alice" }, "false"))),
-    ]);
-    expect(ids.sort()).toEqual(["open_1", "open_2"]);
-    expect((await readForum("open")).commentCount).toBe(2);
-  });
-
-  it("accepts comments on a legacy forum without endTime or commentCount", async () => {
-    expect(await assertSucceeds(createCommentRecord(as.bob, comment("legacy")))).toBe("legacy_1");
-  });
-
-  it("rejects comments impersonating another UID or the 'anonymous' ID", async () => {
-    await assertFails(createCommentRecord(as.bob, { ...comment("open"), userId: "alice" }));
-    await assertFails(createCommentRecord(as.bob, comment("open", authorIdentity(null, "true"))));
+describe("creating comments from the browser", () => {
+  it("denies the old transaction for every user and forum: only the server publishes", async () => {
+    await assertFails(oldBrowserComment(as.bob, "open"));
+    await assertFails(oldBrowserComment(as.alice, "open", { userId: "alice", userName: "Anonymous User" }));
+    await assertFails(oldBrowserComment(as.admin, "open", { userId: "root" }));
+    await assertFails(oldBrowserComment(as.bob, "legacy"));
     expect(await readComment("open_1")).toBeNull();
+    expect((await readForum("open")).commentCount).toBeUndefined();
   });
 
-  it("rejects comments when signed out", async () => {
-    await assertFails(createCommentRecord(as.signedOut, comment("open", authorIdentity(null, "true"))));
-  });
-
-  it.each(["closed", "inactive", "deleted"])("rejects comments on a %s forum, even by its creator", async (id) => {
-    await assertFails(createCommentRecord(as.alice, comment(id, authorIdentity({ uid: "alice" }, "false"))));
-    await assertFails(createCommentRecord(as.admin, comment(id, authorIdentity({ uid: "root" }, "false"))));
-  });
-
-  it("rejects comments on a forum that doesn't exist", async () => {
-    await assertFails(batchWrite(as.bob, "missing_1", rawComment("missing")));
-  });
-
-  it("rejects a comment without the matching commentCount increment", async () => {
+  it("denies single writes, batches and signed-out writes", async () => {
     await assertFails(addDoc(collection(as.bob, "comments"), rawComment("open")));
     await assertFails(setDoc(doc(as.bob, "comments", "open_1"), rawComment("open")));
-    await assertFails(batchWrite(as.bob, "open_7", rawComment("open"), 1)); // ID doesn't match the count
-    await assertFails(batchWrite(as.bob, "open_2", rawComment("open"), 2)); // +2
+    await assertFails(batchWrite(as.bob, "open_1", rawComment("open"), 1));
+    await assertFails(addDoc(collection(as.signedOut, "comments"), rawComment("open")));
   });
 
-  it("rejects forged fields and bad content", async () => {
-    await assertSucceeds(batchWrite(as.bob, "open_1", rawComment("open"), 1));
-    const bad: Array<Record<string, unknown>> = [
-      { upvotes: 50 },
-      { downvotes: 3 },
-      { createdAt: new Date("2020-01-01") },
-      { parentId: "x" },
-      { isAdmin: true },
-      { content: "" },
-      { content: "   " },
-      { content: "x".repeat(5001) },
-      { userName: "" },
-    ];
-    for (const fields of bad) await assertFails(batchWrite(as.bob, "open_2", rawComment("open", fields), 2));
+  it("denies spoofed authors and forged fields", async () => {
+    await assertFails(addDoc(collection(as.bob, "comments"), rawComment("open", { userId: "alice" })));
+    await assertFails(addDoc(collection(as.bob, "comments"), rawComment("open", { upvotes: 50, moderationPolicy: "sfw" })));
   });
 });
 
@@ -188,7 +145,9 @@ describe("reading comments", () => {
 
 describe("changing comments", () => {
   beforeEach(async () => {
-    await assertSucceeds(createCommentRecord(as.bob, comment("open")));
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(asDb(ctx.firestore()), "comments", "open_1"), rawComment("open", { createdAt: new Date() }));
+    });
   });
 
   it("does not allow editing, even by the author", async () => {

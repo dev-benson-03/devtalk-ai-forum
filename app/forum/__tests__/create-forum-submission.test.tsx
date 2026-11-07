@@ -52,7 +52,7 @@ describe("CreateForumPage - Form Submission", () => {
     expect(mockCreateForum).not.toHaveBeenCalled();
   });
 
-  it("calls createForum with correct data structure on successful submission", async () => {
+  it("sends only the form's fields to the server, never an author or server-controlled fields", async () => {
     mockCreateForum.mockResolvedValue("forum-id-123");
     
     render(<CreateForumPageWithRouter />);
@@ -62,19 +62,74 @@ describe("CreateForumPage - Form Submission", () => {
     fireEvent.click(submitButton);
 
     await waitFor(() => {
-      expect(mockCreateForum).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: "Test Forum",
-          description: "Test description",
-          question: "Test question?",
-          creatorId: "anonymous",
-          creatorName: "Anonymous User",
-          isActive: true,
-          isAdminDeleted: false,
-          tags: ["Technology"]
-        })
+      expect(mockCreateForum).toHaveBeenCalledWith({
+        title: "Test Forum",
+        description: "Test description",
+        question: "Test question?",
+        category: "Technology",
+        timeLimitHours: 0.083,
+        anonymous: true,
+        requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      });
+    });
+  });
+
+  it("shows the support message only when the server asks for it", async () => {
+    const { SUPPORT_MESSAGE } = jest.requireActual("../publish-client");
+    mockCreateForum.mockResolvedValueOnce({ id: "f1", support: true });
+    const { unmount } = render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(SUPPORT_MESSAGE));
+    unmount();
+
+    (global.alert as jest.Mock).mockClear();
+    mockCreateForum.mockResolvedValueOnce({ id: "f2" });
+    render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(mockCreateForum).toHaveBeenCalledTimes(2));
+    expect(global.alert).not.toHaveBeenCalledWith(SUPPORT_MESSAGE);
+  });
+
+  it("keeps the draft and the same request ID after a moderation rejection, so a revision can be resubmitted", async () => {
+    const { PublishError } = jest.requireActual("../publish-client");
+    mockCreateForum.mockRejectedValueOnce(new PublishError("rejected", 422, "profanity", "title")).mockResolvedValueOnce("id");
+
+    render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+
+    await waitFor(() => {
+      expect(global.alert).toHaveBeenCalledWith(
+        "Your title doesn't meet DevTalk's community guidelines (strong profanity). Please revise it and try again."
       );
     });
+    expect(screen.getByLabelText(/forum title/i)).toHaveValue("Test Forum");
+    expect(screen.getByLabelText(/description/i)).toHaveValue("Test description");
+
+    fireEvent.change(screen.getByLabelText(/forum title/i), { target: { value: "Revised" } });
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+    await waitFor(() => expect(mockCreateForum).toHaveBeenCalledTimes(2));
+    const [first, second] = mockCreateForum.mock.calls.map(([arg]) => arg);
+    expect(second).toMatchObject({ title: "Revised", requestId: first.requestId });
+  });
+
+  it("explains a moderation outage and keeps the draft", async () => {
+    const { PublishError } = jest.requireActual("../publish-client");
+    mockCreateForum.mockRejectedValue(new PublishError("unavailable", 503, "moderation_unavailable"));
+
+    render(<CreateForumPageWithRouter />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create forum/i }));
+
+    await waitFor(() => {
+      expect(global.alert).toHaveBeenCalledWith(
+        "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment."
+      );
+    });
+    expect(screen.getByLabelText(/main question/i)).toHaveValue("Test question?");
+    expect(screen.getByRole("button", { name: /create forum/i })).toBeEnabled();
   });
 
   it("shows loading state during submission", async () => {

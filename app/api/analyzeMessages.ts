@@ -36,6 +36,7 @@ import {
   releaseGeneration,
 } from "./analysis-limits.server";
 import { parseModelAnalysis, type AnalysisText } from "./analysis-output";
+import { buildAnalysisMessages, type ThreadText } from "./analysis-prompt";
 import { readAnalysisRequest } from "./analyze-request";
 
 type Firestore = ReturnType<typeof getAdminDb>;
@@ -105,18 +106,14 @@ async function authenticate(request: Request): Promise<AuthenticatedUser | Respo
 }
 
 /** Groups comments by thread for hierarchical analysis (no parentId → "main"). */
-function buildThreadSummaries(comments: TrustedComment[]): string[] {
-  const byThread = new Map<string, TrustedComment[]>();
+function groupThreads(comments: TrustedComment[]): ThreadText[] {
+  const byThread = new Map<string, string[]>();
   for (const comment of comments) {
     const threadKey = comment.parentId || "main";
     if (!byThread.has(threadKey)) byThread.set(threadKey, []);
-    byThread.get(threadKey)!.push(comment);
+    byThread.get(threadKey)!.push(comment.content);
   }
-  const threadSummaries: string[] = [];
-  for (const [threadKey, threadComments] of byThread) {
-    threadSummaries.push(`Thread "${threadKey}": ${threadComments.map((c) => c.content).join("\n")}`);
-  }
-  return threadSummaries;
+  return [...byThread].map(([thread, texts]) => ({ thread, comments: texts }));
 }
 
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
@@ -128,22 +125,6 @@ const forumContextOf = (forum: Record<string, unknown>): ForumContext => ({
   question: text(forum.question),
   category: Array.isArray(forum.tags) ? text(forum.tags[0]) : "",
 });
-
-function buildPrompt(ctx: ForumContext, threadSummaries: string[]): string {
-  const forumContext = ctx.title
-    ? `Forum: "${ctx.title}"${ctx.description ? `\nDescription: ${ctx.description}` : ''}${ctx.question ? `\nQuestion: ${ctx.question}` : ''}${ctx.category ? `\nCategory: ${ctx.category}` : ''}\n\n`
-    : '';
-  return `
-${forumContext}Perform hierarchical analysis:
-1. Analyze each thread's diction, tone, structure, and emotional intent
-2. Synthesize into forum-level summary with Gen Z-friendly insights
-3. Create actionable 3-step roadmap
-
-Threads:
-${threadSummaries.join('\n\n')}
-
-Return JSON: {"summary": "...", "actionRoadmap": ["1️⃣ ...", "2️⃣ ...", "3️⃣ ..."]}`;
-}
 
 export async function action({ request }: { request: Request }): Promise<Response> {
   const started = Date.now();
@@ -293,13 +274,13 @@ async function analyze(input: AnalyzeInput): Promise<Response> {
   //    (which releases the lock atomically), the lock is released afterwards.
   let releaseLock = true;
   try {
-    const threadSummaries = buildThreadSummaries(comments);
+    const threads = groupThreads(comments);
     log("info", "openai_request", {
       forumId,
       keyRef,
       totalMessages: counts.totalMessages,
       analyzedMessages: comments.length,
-      threads: threadSummaries.length,
+      threads: threads.length,
       forceRegenerate,
     });
     let aiResponse = "";
@@ -307,7 +288,8 @@ async function analyze(input: AnalyzeInput): Promise<Response> {
       const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: OPENAI_TIMEOUT_MS, maxRetries: OPENAI_MAX_RETRIES });
       const completion = await openai.chat.completions.create({
         model: ANALYSIS_MODEL,
-        messages: [{ role: "user", content: buildPrompt(context, threadSummaries) }],
+        // Instructions in the system message; forum text only as quoted data
+        messages: buildAnalysisMessages(context, threads),
         temperature: ANALYSIS_TEMPERATURE,
       });
       aiResponse = completion.choices[0]?.message?.content || "";

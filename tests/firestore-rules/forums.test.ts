@@ -12,11 +12,11 @@ import {
   getDoc,
   getDocs,
   query,
+  setDoc,
   updateDoc,
   where,
   type Firestore,
 } from "firebase/firestore";
-import { buildForumDocument } from "../../app/forum/forum-document";
 import { listedForumsQuery } from "../../app/hooks/forum-data";
 import { contexts, forum, seedForums } from "./fixtures";
 import { startRulesEnv } from "./setup";
@@ -87,54 +87,44 @@ describe("listing forums", () => {
   });
 });
 
-describe("creating forums", () => {
-  const form = { title: "New", description: "Desc", question: "Why?", category: "Technology", timeLimit: 1 };
-  const alice = { uid: "alice", displayName: "Alice" };
+describe("creating forums from the browser", () => {
   const create = (db: Firestore, data: Record<string, unknown>) => addDoc(collection(db, "forums"), data);
+  /** The document the create-forum page wrote directly before Phase 3B. */
+  const oldPageDocument = (uid: string) => forum({ creatorId: uid, creatorName: "Alice" });
 
-  it("accepts the create-forum page's document for the signed-in creator", async () => {
-    await assertSucceeds(create(as.alice, buildForumDocument(form, alice, "false")));
-    await assertSucceeds(create(as.alice, buildForumDocument({ ...form, category: "", timeLimit: 168 }, alice, "true")));
-  });
-
-  it("rejects a forum owned by someone else, by 'anonymous', or created signed out", async () => {
-    await assertFails(create(as.bob, buildForumDocument(form, alice, "false")));
-    await assertFails(create(as.alice, buildForumDocument(form, null, "false")));
-    await assertFails(create(as.signedOut, buildForumDocument(form, alice, "false")));
+  it("is denied for everyone, even with the old page's exact document: only the server publishes", async () => {
+    await assertFails(create(as.alice, oldPageDocument("alice")));
+    await assertFails(setDoc(doc(as.alice, "forums", "mine"), oldPageDocument("alice")));
+    await assertFails(create(as.admin, oldPageDocument("root")));
+    await assertFails(create(as.signedOut, oldPageDocument("alice")));
   });
 
   it.each([
-    ["inactive", { isActive: false }],
-    ["admin-deleted", { isAdminDeleted: true }],
-    ["server analysis fields", { analysisSummary: "Fake", lastAnalyzedAt: "2026-01-01" }],
-    ["a prefilled summary", { summary: "Fake" }],
-    ["a prefilled roadmap", { actionRoadmap: ["1", "2", "3"] }],
+    ["another user's UID", { creatorId: "bob" }],
+    ["prefilled analysis fields", { analysisSummary: "Fake", lastAnalyzedAt: "2026-01-01" }],
     ["a comment count", { commentCount: 50 }],
-    ["votes", { upvotes: 10 }],
-    ["an end time in the past", { endTime: Timestamp.fromMillis(Date.now() - 1000) }],
-    ["an end time beyond the form's maximum", { endTime: Timestamp.fromMillis(Date.now() + 30 * 86_400_000) }],
-    ["a string end time", { endTime: "2030-01-01" }],
-    ["a blank title", { title: "   " }],
-    ["a too-long title", { title: "t".repeat(201) }],
-    ["two tags", { tags: ["a", "b"] }],
-    ["a non-string question", { question: 42 }],
-  ])("rejects a new forum with %s", async (_label, patch) => {
+    ["an admin flag", { isAdmin: true }],
+  ])("is denied with %s", async (_label, patch) => {
     await assertFails(create(as.alice, forum(patch)));
-  });
-
-  it("rejects a new forum missing required fields", async () => {
-    const { description: _omit, ...rest } = forum();
-    await assertFails(create(as.alice, rest));
   });
 });
 
 describe("updating forums", () => {
   const update = (db: Firestore, id: string, data: Record<string, unknown>) => updateDoc(doc(db, "forums", id), data);
 
-  it("lets the creator edit text, category and visibility", async () => {
-    await assertSucceeds(update(as.alice, "open", { title: "Edited", question: "Still?", tags: ["Other"] }));
+  it("lets the creator hide and re-show their forum", async () => {
     await assertSucceeds(update(as.alice, "open", { isActive: false }));
     await assertSucceeds(update(as.alice, "inactive", { isActive: true }));
+  });
+
+  it.each([
+    ["the title", { title: "Edited" }],
+    ["the description", { description: "Edited" }],
+    ["the question", { question: "Still?" }],
+    ["the category", { tags: ["Other"] }],
+    ["text together with visibility", { title: "Edited", isActive: false }],
+  ])("rejects the creator editing %s, which would skip moderation", async (_label, patch) => {
+    await assertFails(update(as.alice, "open", patch));
   });
 
   it("rejects edits by other users", async () => {
@@ -153,13 +143,14 @@ describe("updating forums", () => {
     ["the legacy summary", { summary: "Fake" }],
     ["the comment count", { commentCount: 99 }],
     ["the end time", { endTime: Timestamp.fromMillis(Date.now() + 86_400_000 * 7) }],
-    ["a blank title", { title: "" }],
+    ["the moderation marker", { moderationPolicy: "none" }],
+    ["visibility to a non-boolean", { isActive: "no" }],
   ])("rejects the creator changing %s", async (_label, patch) => {
     await assertFails(update(as.alice, "open", patch));
   });
 
   it("freezes admin-deleted forums for their creator", async () => {
-    await assertFails(update(as.alice, "deleted", { title: "Back" }));
+    await assertFails(update(as.alice, "deleted", { isActive: false }));
     await assertFails(update(as.alice, "deleted", { isAdminDeleted: false }));
   });
 
@@ -175,9 +166,10 @@ describe("updating forums", () => {
     await assertFails(update(as.admin, "open", { analysisSummary: "Fake" }));
   });
 
-  it("rejects a bare +1 to commentCount without a new comment", async () => {
+  it("rejects any browser change to commentCount", async () => {
     await assertFails(update(as.bob, "open", { commentCount: 1 }));
     await assertFails(update(as.alice, "open", { commentCount: 1 }));
+    await assertFails(update(as.admin, "open", { commentCount: 1 }));
   });
 });
 

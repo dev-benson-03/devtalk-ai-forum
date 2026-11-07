@@ -238,9 +238,13 @@ tokens, comment text, forum conversations, model output, UIDs or keys.
   remove the hardcoded browser UID before relying on admin paths.
 - **Anonymous comments** still store the real UID in `userId` (pre-existing);
   it is only used for counting and is never sent to OpenAI or logged.
-- **Comment prompt injection:** comment text goes to the model as before;
-  the saved fields are type-checked but their wording is model-controlled.
+- **Comment prompt injection:** since Phase 3B the instructions are in the
+  system message and forum text goes in only as quoted JSON data
+  (`app/api/analysis-prompt.ts`). The saved fields are still type-checked,
+  and their wording is still model-controlled.
 - **2,000-doc read cap** has no ordering, so a forum with more comments
   analyzes an arbitrary subset (none are that large today).
 - **Firestore rules** are still deny-all, so the forum page's own client
-  reads fail until rules are published; this route does not depend on them.
+  reads fail until rules are published. This route doesn't depend on them,
+  but the What's Tea button lives on that page, so the normal UI is blocked
+  too (see `firestore-rules.md`).

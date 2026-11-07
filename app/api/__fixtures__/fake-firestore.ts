@@ -1,12 +1,13 @@
 /**
  * In-memory stand-in for the parts of the Admin Firestore API the analysis
- * route uses: doc get/set/update, where().limit().get(), and serialized
- * runTransaction (like Firestore's server-side locking). Tests only.
+ * and publishing routes use: doc get/set/update (doc() without an ID makes
+ * one), where().limit().get(), and serialized runTransaction with
+ * get/set/update/create (like Firestore's server-side locking). Tests only.
  */
 type Data = Record<string, unknown>;
 
 export interface FakeWrite {
-  op: "set" | "update";
+  op: "set" | "update" | "create";
   collection: string;
   id: string;
   data: Data;
@@ -20,6 +21,7 @@ export class FakeFirestore {
   /** Collections whose writes (only) throw this error. */
   writeFailures = new Map<string, unknown>();
   private queue: Promise<unknown> = Promise.resolve();
+  private nextId = 0;
 
   seed(collection: string, id: string, data: Data) {
     this.docs.set(`${collection}/${id}`, data);
@@ -50,6 +52,9 @@ export class FakeFirestore {
     if (op === "update" && !this.docs.has(`${collection}/${id}`)) {
       throw Object.assign(new Error("NOT_FOUND"), { code: 5 });
     }
+    if (op === "create" && this.docs.has(`${collection}/${id}`)) {
+      throw Object.assign(new Error("ALREADY_EXISTS"), { code: 6 });
+    }
   }
 
   private write(op: FakeWrite["op"], collection: string, id: string, data: Data, merge = false) {
@@ -62,7 +67,7 @@ export class FakeFirestore {
 
   collection(name: string) {
     return {
-      doc: (id: string) => ({
+      doc: (id: string = `auto${++this.nextId}`) => ({
         __collection: name,
         id,
         get: async () => this.snapshot(name, id),
@@ -100,6 +105,9 @@ export class FakeFirestore {
         update: (ref: Ref, data: Data) => {
           pending.push({ op: "update", ref, data });
         },
+        create: (ref: Ref, data: Data) => {
+          pending.push({ op: "create", ref, data });
+        },
       };
       const result = await fn(tx);
       pending.forEach((w) => this.checkWrite(w.op, w.ref.__collection, w.ref.id));
@@ -115,4 +123,5 @@ export interface FakeTransaction {
   get(ref: unknown): Promise<{ id: string; exists: boolean; data: () => Data | undefined }>;
   set(ref: unknown, data: Data, options?: { merge?: boolean }): void;
   update(ref: unknown, data: Data): void;
+  create(ref: unknown, data: Data): void;
 }
