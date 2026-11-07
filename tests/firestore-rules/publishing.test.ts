@@ -117,6 +117,39 @@ describe("publishing comments", () => {
     expect(await forumCount("open")).toBe(1);
   });
 
+  it("rejects a changed submission under the same requestId, also when sent concurrently", async () => {
+    const id = requestId();
+    const outcomes = await Promise.all([
+      publishComment(deps(), bob, { ...comment("open", id), content: "First version" }),
+      publishComment(deps(), bob, { ...comment("open", id), content: "Second version" }),
+    ]);
+    expect(outcomes.map((o) => o.kind).sort()).toEqual(["published", "request_reused"]);
+    expect(await commentsOf("open")).toHaveLength(1);
+    expect(await forumCount("open")).toBe(1);
+    // The identical submission still gets the original ID
+    const winner = outcomes.find((o) => o.kind === "published") as { id: string };
+    const content = (await commentsOf("open"))[0].data().content;
+    expect(await publishComment(deps(), bob, { ...comment("open", id), content })).toEqual({
+      kind: "published",
+      id: winner.id,
+      duplicate: true,
+    });
+  });
+
+  it("re-checks the receipt digest inside the transaction", async () => {
+    const id = requestId();
+    // Another request with the same ID but different content lands while moderation runs
+    const racing: Moderator = {
+      moderate: async () => {
+        await publishComment(deps(), bob, { ...comment("open", id), content: "The other version" });
+        return { allowed: true, policyVersion: MODERATION_POLICY_VERSION };
+      },
+    };
+    expect((await publishComment(deps(racing), bob, comment("open", id))).kind).toBe("request_reused");
+    expect(await commentsOf("open")).toHaveLength(1);
+    expect(await forumCount("open")).toBe(1);
+  });
+
   it("starts legacy forums without commentCount at 1", async () => {
     await publishComment(deps(), bob, comment("legacy"));
     expect(await forumCount("legacy")).toBe(1);

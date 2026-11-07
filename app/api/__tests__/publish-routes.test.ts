@@ -388,6 +388,43 @@ describe("publishing routes", () => {
       expect(mockDb.read("forums", "open")!.commentCount).toBe(1);
     });
 
+    it("rejects a changed submission under a used requestId, without moderating or writing", async () => {
+      const first = await (await createComment(post("/api/comments", commentBody()))).json();
+      mockModerate.mockClear();
+      const writes = mockDb.writes.length;
+      for (const changed of [{ content: "Edited text" }, { anonymous: true }, { forumId: "legacy" }]) {
+        const res = await createComment(post("/api/comments", commentBody(changed)));
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ error: "Invalid request", reason: "request_reused" });
+      }
+      expect(mockModerate).not.toHaveBeenCalled();
+      expect(mockDb.writes).toHaveLength(writes);
+      expect(docsIn("comments")).toEqual([expect.objectContaining({ content: "Zustand, because it is small." })]);
+      expect((await (await createComment(post("/api/comments", commentBody()))).json()).id).toBe(first.id);
+    });
+
+    it("binds forum receipts to every field that changes the forum", async () => {
+      await createForum(post("/api/forums", forumBody()));
+      for (const changed of [{ title: "Other" }, { category: "Other" }, { timeLimitHours: 1 }, { anonymous: true }]) {
+        expect((await createForum(post("/api/forums", forumBody(changed)))).status).toBe(409);
+      }
+      expect(docsIn("forums").filter((f) => f.creatorId === "dana")).toHaveLength(1);
+    });
+
+    it("stores only a digest in the receipt, never the text", async () => {
+      await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
+      const [receipt] = docsIn(RECEIPT_COLLECTION);
+      expect(receipt.digest).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(receipt)).not.toContain(PRIVATE_TEXT);
+      expect(JSON.stringify(receipt)).not.toContain("Dana Dev");
+    });
+
+    it("lets a rejected submission be corrected and resent with the same requestId", async () => {
+      moderationSays({ [PRIVATE_TEXT]: { harassment: true } });
+      expect((await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })))).status).toBe(422);
+      expect((await createComment(post("/api/comments", commentBody({ content: "A kinder version" })))).status).toBe(201);
+    });
+
     it("does not let one requestId publish both a forum and a comment", async () => {
       await createForum(post("/api/forums", forumBody()));
       const res = await createComment(post("/api/comments", commentBody()));

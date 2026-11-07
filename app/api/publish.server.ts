@@ -3,7 +3,8 @@
  * new forums and comments reach Firestore: firestore.rules deny browser
  * creates, so these checks are the whole gate. Order for each submission:
  *
- *   1. Duplicate check (the draft's requestId was already published?)
+ *   1. Duplicate check: was this requestId already used? Only the identical
+ *      submission (same SHA-256 digest) counts as a duplicate.
  *   2. Forum state check (comments): exists, visible, open
  *   3. Moderation of every publishable text, outside any transaction
  *   4. One transaction that re-checks the duplicate and the forum state,
@@ -58,6 +59,26 @@ export function displayNameFor(user: AuthenticatedUser, anonymous: boolean): str
 export const receiptId = (uid: string, requestId: string) =>
   createHash("sha256").update(`${uid}\u0000${requestId}`).digest("hex");
 
+const sha256 = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+/**
+ * SHA-256 of the validated submission, bound to the operation and the
+ * verified UID. Encoded as a JSON array in a fixed order, so the same
+ * submission always gives the same digest. Every input that changes the
+ * published record is included; the receipt stores only this digest,
+ * never the text.
+ */
+export function forumDigest(uid: string, input: ForumRequest): string {
+  return sha256([
+    "devtalk-publish-v1", "forum", uid,
+    input.title, input.description, input.question, input.category, input.timeLimitHours, input.anonymous,
+  ]);
+}
+
+export function commentDigest(uid: string, input: CommentRequest): string {
+  return sha256(["devtalk-publish-v1", "comment", uid, input.forumId, input.content, input.anonymous]);
+}
+
 /** Comments are accepted while the forum is active, not deleted and before endTime (legacy: no endTime = open). */
 export function acceptsComments(forum: Record<string, unknown>, now: Date): boolean {
   if (forum.isAdminDeleted === true || forum.isActive === false) return false;
@@ -67,9 +88,16 @@ export function acceptsComments(forum: Record<string, unknown>, now: Date): bool
 
 type ReceiptCheck = { kind: "none" } | { kind: "same"; id: string } | { kind: "reused" };
 
-function checkReceipt(data: Record<string, unknown> | undefined, kind: "forum" | "comment"): ReceiptCheck {
+/**
+ * Same kind and same digest: the same submission, already published.
+ * Anything else under this requestId (another operation, changed content,
+ * a receipt without a digest) is a reused ID and never reported as success.
+ */
+function checkReceipt(data: Record<string, unknown> | undefined, kind: "forum" | "comment", digest: string): ReceiptCheck {
   if (!data) return { kind: "none" };
-  return data.kind === kind && typeof data.targetId === "string" ? { kind: "same", id: data.targetId } : { kind: "reused" };
+  return data.kind === kind && data.digest === digest && typeof data.targetId === "string"
+    ? { kind: "same", id: data.targetId }
+    : { kind: "reused" };
 }
 
 const fromReceipt = (check: ReceiptCheck): PublishOutcome | null =>
@@ -79,9 +107,10 @@ const fromReceipt = (check: ReceiptCheck): PublishOutcome | null =>
       ? { kind: "request_reused" }
       : null;
 
-const receipt = (uid: string, kind: "forum" | "comment", targetId: string, now: Date, forumId?: string) => ({
+const receipt = (uid: string, kind: "forum" | "comment", digest: string, targetId: string, now: Date, forumId?: string) => ({
   uid,
   kind,
+  digest,
   targetId,
   ...(forumId ? { forumId } : {}),
   createdAt: FieldValue.serverTimestamp(),
@@ -100,8 +129,9 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
   const { db, moderator } = deps;
   const now = (deps.now ?? (() => new Date()))();
   const receiptRef = db.collection(RECEIPT_COLLECTION).doc(receiptId(user.uid, input.requestId));
+  const digest = forumDigest(user.uid, input);
 
-  const earlier = fromReceipt(checkReceipt((await receiptRef.get()).data(), "forum"));
+  const earlier = fromReceipt(checkReceipt((await receiptRef.get()).data(), "forum", digest));
   if (earlier) return earlier;
 
   const creatorName = displayNameFor(user, input.anonymous);
@@ -121,7 +151,7 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
   const forumRef = db.collection("forums").doc();
   const endTime = Timestamp.fromMillis(now.getTime() + Math.round(input.timeLimitHours * 3_600_000));
   return db.runTransaction(async (tx) => {
-    const again = fromReceipt(checkReceipt((await tx.get(receiptRef)).data(), "forum"));
+    const again = fromReceipt(checkReceipt((await tx.get(receiptRef)).data(), "forum", digest));
     if (again) return again;
     tx.create(forumRef, {
       title: input.title,
@@ -140,7 +170,7 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
       createdAt: FieldValue.serverTimestamp(),
       moderationPolicy: decision.policyVersion,
     });
-    tx.create(receiptRef, receipt(user.uid, "forum", forumRef.id, now));
+    tx.create(receiptRef, receipt(user.uid, "forum", digest, forumRef.id, now));
     return { kind: "published", id: forumRef.id, duplicate: false };
   });
 }
@@ -166,8 +196,9 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
   const clock = deps.now ?? (() => new Date());
   const receiptRef = db.collection(RECEIPT_COLLECTION).doc(receiptId(user.uid, input.requestId));
   const forumRef = db.collection("forums").doc(input.forumId);
+  const digest = commentDigest(user.uid, input);
 
-  const earlier = fromReceipt(checkReceipt((await receiptRef.get()).data(), "comment"));
+  const earlier = fromReceipt(checkReceipt((await receiptRef.get()).data(), "comment", digest));
   if (earlier) return earlier;
   const blocked = forumGate(user, (await forumRef.get()).data(), clock());
   if (blocked) return blocked;
@@ -179,7 +210,7 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
   return db.runTransaction(async (tx) => {
     const receiptSnap = await tx.get(receiptRef);
     const forumSnap = await tx.get(forumRef);
-    const again = fromReceipt(checkReceipt(receiptSnap.data(), "comment"));
+    const again = fromReceipt(checkReceipt(receiptSnap.data(), "comment", digest));
     if (again) return again;
     const now = clock();
     const stillBlocked = forumGate(user, forumSnap.data(), now);
@@ -197,7 +228,7 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
       moderationPolicy: decision.policyVersion,
     });
     tx.update(forumRef, { commentCount: countOf(forumSnap.data()?.commentCount) + 1 });
-    tx.create(receiptRef, receipt(user.uid, "comment", commentRef.id, now, input.forumId));
+    tx.create(receiptRef, receipt(user.uid, "comment", digest, commentRef.id, now, input.forumId));
     return { kind: "published", id: commentRef.id, duplicate: false };
   });
 }
