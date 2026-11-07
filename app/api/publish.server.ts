@@ -31,8 +31,9 @@ export const RECEIPT_COLLECTION = "publishRequests";
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type PublishOutcome =
-  | { kind: "published"; id: string; duplicate: boolean }
-  | { kind: "rejected"; reason: PolicyReason; field: string }
+  // support: show the author the support message (never stored or logged)
+  | { kind: "published"; id: string; duplicate: boolean; support?: boolean }
+  | { kind: "rejected"; reason: PolicyReason; field: string; support: boolean }
   | { kind: "not_found" }
   | { kind: "forbidden" }
   | { kind: "closed" }
@@ -146,7 +147,7 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
       input.anonymous
     )
   );
-  if (!decision.allowed) return { kind: "rejected", reason: decision.reason, field: decision.field };
+  if (!decision.allowed) return { kind: "rejected", reason: decision.reason, field: decision.field, support: decision.support };
 
   const forumRef = db.collection("forums").doc();
   const endTime = Timestamp.fromMillis(now.getTime() + Math.round(input.timeLimitHours * 3_600_000));
@@ -171,7 +172,7 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
       moderationPolicy: decision.policyVersion,
     });
     tx.create(receiptRef, receipt(user.uid, "forum", digest, forumRef.id, now));
-    return { kind: "published", id: forumRef.id, duplicate: false };
+    return { kind: "published", id: forumRef.id, duplicate: false, support: decision.support };
   });
 }
 
@@ -205,7 +206,7 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
 
   const userName = displayNameFor(user, input.anonymous);
   const decision = await moderator.moderate(withName([{ name: "content", text: input.content }], userName, input.anonymous));
-  if (!decision.allowed) return { kind: "rejected", reason: decision.reason, field: decision.field };
+  if (!decision.allowed) return { kind: "rejected", reason: decision.reason, field: decision.field, support: decision.support };
 
   return db.runTransaction(async (tx) => {
     const receiptSnap = await tx.get(receiptRef);
@@ -229,6 +230,6 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
     });
     tx.update(forumRef, { commentCount: countOf(forumSnap.data()?.commentCount) + 1 });
     tx.create(receiptRef, receipt(user.uid, "comment", digest, commentRef.id, now, input.forumId));
-    return { kind: "published", id: commentRef.id, duplicate: false };
+    return { kind: "published", id: commentRef.id, duplicate: false, support: decision.support };
   });
 }

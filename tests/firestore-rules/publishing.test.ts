@@ -41,9 +41,9 @@ beforeEach(async () => {
 const userFor = (uid: string, claims: Record<string, unknown> = {}) =>
   ({ uid, token: { uid, name: uid[0].toUpperCase() + uid.slice(1), ...claims } }) as unknown as AuthenticatedUser;
 const bob = userFor("bob");
-const approve: Moderator = { moderate: async () => ({ allowed: true, policyVersion: MODERATION_POLICY_VERSION }) };
+const approve: Moderator = { moderate: async () => ({ allowed: true, policyVersion: MODERATION_POLICY_VERSION, support: false }) };
 const reject: Moderator = {
-  moderate: async () => ({ allowed: false, policyVersion: MODERATION_POLICY_VERSION, reason: "sexual", field: "content" }),
+  moderate: async () => ({ allowed: false, policyVersion: MODERATION_POLICY_VERSION, reason: "sexual", field: "content", support: false }),
 };
 const deps = (moderator: Moderator = approve) => ({ db: admin as never, moderator });
 
@@ -142,7 +142,7 @@ describe("publishing comments", () => {
     const racing: Moderator = {
       moderate: async () => {
         await publishComment(deps(), bob, { ...comment("open", id), content: "The other version" });
-        return { allowed: true, policyVersion: MODERATION_POLICY_VERSION };
+        return { allowed: true, policyVersion: MODERATION_POLICY_VERSION, support: false };
       },
     };
     expect((await publishComment(deps(racing), bob, comment("open", id))).kind).toBe("request_reused");
@@ -172,7 +172,7 @@ describe("publishing comments", () => {
     const slow: Moderator = {
       moderate: async () => {
         await admin.collection("forums").doc("open").update(change);
-        return { allowed: true, policyVersion: MODERATION_POLICY_VERSION };
+        return { allowed: true, policyVersion: MODERATION_POLICY_VERSION, support: false };
       },
     };
     const outcome = await publishComment(deps(slow), bob, comment());

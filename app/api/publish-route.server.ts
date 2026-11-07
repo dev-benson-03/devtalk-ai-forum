@@ -34,10 +34,17 @@ function safeErrorCode(error: unknown): string {
 
 function toResponse(outcome: PublishOutcome): Response {
   switch (outcome.kind) {
+    // `support` only ever goes back to the author in this response
     case "published":
-      return json({ id: outcome.id, duplicate: outcome.duplicate }, outcome.duplicate ? 200 : 201);
+      return json(
+        { id: outcome.id, duplicate: outcome.duplicate, ...(outcome.support ? { support: true } : {}) },
+        outcome.duplicate ? 200 : 201
+      );
     case "rejected":
-      return json({ error: "Content not allowed", reason: outcome.reason, field: outcome.field }, 422);
+      return json(
+        { error: "Content not allowed", reason: outcome.reason, field: outcome.field, ...(outcome.support ? { support: true } : {}) },
+        422
+      );
     case "not_found":
       return json({ error: "Forum not found" }, 404);
     case "forbidden":

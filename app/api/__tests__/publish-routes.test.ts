@@ -241,10 +241,11 @@ describe("publishing routes", () => {
       expect(mockDb.writes).toHaveLength(0);
     });
 
-    it("rejects strong profanity in the title without asking the provider", async () => {
+    it("rejects strong profanity in the title and writes nothing", async () => {
       const res = await createForum(post("/api/forums", forumBody({ title: "Why is this sh1t so slow" })));
-      expect(await res.json()).toMatchObject({ reason: "profanity", field: "title" });
-      expect(mockModerate).not.toHaveBeenCalled();
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({ error: "Content not allowed", reason: "profanity", field: "title" });
+      expect(docsIn("forums").filter((f) => f.creatorId === "dana")).toHaveLength(0);
     });
 
     it("rejects a profane display name, unless posting anonymously", async () => {
@@ -313,6 +314,37 @@ describe("publishing routes", () => {
         moderationPolicy: MODERATION_POLICY_VERSION,
       });
       expect(mockDb.read("forums", "open")!.commentCount).toBe(1);
+    });
+
+    it("publishes a personal disclosure and tells only the author to show the support message", async () => {
+      moderationSays({ [PRIVATE_TEXT]: { "self-harm/intent": true } });
+      const res = await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body).toEqual({ id: body.id, duplicate: false, support: true });
+      // Never stored, logged or put on the receipt
+      const stored = JSON.stringify([...mockDb.docs.values()]);
+      expect(stored).not.toContain("support");
+      expect(stored).not.toContain("self-harm");
+      expect(loggedText()).not.toContain("support");
+      // A retry of the same request returns the original ID without the flag
+      expect(await (await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })))).json()).toEqual({
+        id: body.id,
+        duplicate: true,
+      });
+    });
+
+    it("rejects self-harm instructions even with a disclosure, writes nothing and returns the support flag", async () => {
+      moderationSays({ [PRIVATE_TEXT]: { "self-harm/intent": true, "self-harm/instructions": true } });
+      const res = await createComment(post("/api/comments", commentBody({ content: PRIVATE_TEXT })));
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({ error: "Content not allowed", reason: "self_harm", field: "content", support: true });
+      expect(mockDb.writes).toHaveLength(0);
+      expect(loggedText()).not.toContain("support");
+    });
+
+    it("leaves the support flag out of ordinary responses", async () => {
+      expect(await (await createComment(post("/api/comments", commentBody()))).json()).not.toHaveProperty("support");
     });
 
     it("keeps the verified UID behind the anonymous name", async () => {

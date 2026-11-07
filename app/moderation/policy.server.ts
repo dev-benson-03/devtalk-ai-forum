@@ -5,7 +5,7 @@
  */
 
 /** Stored on every forum and comment published under this policy. */
-export const MODERATION_POLICY_VERSION = "sfw-2026-11-06";
+export const MODERATION_POLICY_VERSION = "sfw-2026-11-07";
 
 /** Provider model (OpenAI Moderation API; free to use with the existing key). */
 export const MODERATION_MODEL = "omni-moderation-latest";
@@ -16,6 +16,7 @@ export const MODERATION_MODEL = "omni-moderation-latest";
  */
 export type PolicyReason =
   | "sexual"
+  | "self_harm"
   | "profanity"
   | "hate_harassment"
   | "threat"
@@ -34,7 +35,6 @@ export const BLOCK_WHEN_FLAGGED: Readonly<Record<string, PolicyReason>> = {
   "hate/threatening": "threat",
   "harassment/threatening": "threat",
   "violence/graphic": "graphic_violence",
-  "self-harm/instructions": "unsafe",
   "illicit/violent": "unsafe",
 };
 
@@ -45,18 +45,32 @@ export const BLOCK_WHEN_FLAGGED: Readonly<Record<string, PolicyReason>> = {
 export const BLOCK_AT_HIGH_SCORE: Readonly<Record<string, PolicyReason>> = {
   violence: "graphic_violence",
   illicit: "unsafe",
-  "self-harm": "unsafe",
 };
 export const HIGH_SCORE_THRESHOLD = 0.9;
 
 /**
- * Not blocked: "self-harm/intent". A person saying they are struggling
- * should not get a rejection message. See the policy doc's open questions.
+ * Self-harm is decided from the three self-harm categories together
+ * (selfHarmDecision in moderation.server.ts; content-policy.md explains why):
+ *
+ *   1. Instructions ("self-harm/instructions" flagged, or its score at
+ *      least SELF_HARM_INSTRUCTIONS_CAUTION) → reject, whatever else is
+ *      flagged. Intent never makes method content acceptable.
+ *   2. "self-harm" flagged without "self-harm/intent" → reject. Content
+ *      that promotes, encourages or depicts self-harm and is not a personal
+ *      disclosure; treated conservatively.
+ *   3. "self-harm/intent" flagged (with or without "self-harm", at any
+ *      score) and no instructions → allowed: a personal disclosure or a
+ *      request for support. The author is shown a support message.
+ *
+ * Scores are classifier confidence, not a measure of anyone's personal
+ * danger, and are never shown or stored.
  */
+export const SELF_HARM_INSTRUCTIONS_CAUTION = 0.5;
 
 /** When several reasons apply, the first in this list is reported. */
 export const REASON_PRIORITY: readonly PolicyReason[] = [
   "threat",
+  "self_harm",
   "sexual",
   "hate_harassment",
   "graphic_violence",
