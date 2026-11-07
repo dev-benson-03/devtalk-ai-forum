@@ -83,9 +83,10 @@ Rejected requests (401, 400, 403, 404, 409, 422, 429, 503) never call OpenAI.
   limit, no forum is near it today; fixing it needs ordered pagination).
 - **Counts:** `totalMessages` and `uniqueAuthors` are always recomputed from
   the comments loaded for the request, also on a cache hit.
-- **Client manipulation:** Firestore rules are deny-all today. Phase 3 rules
-  must keep `analysisCache`, `analysisState` and `analysisRateLimits` closed
-  to clients (`allow read, write: if false`); only the Admin SDK uses them.
+- **Client manipulation:** Firestore rules are deny-all today. The Phase 3
+  rules in the repo keep `analysisCache`, `analysisState` and
+  `analysisRateLimits` closed to clients (`allow read, write: if false`);
+  only the Admin SDK uses them.
 
 ## Regeneration: retrieval vs authorized refresh
 
@@ -181,8 +182,13 @@ comment text, forum text or model output.
   quota. Account creation is not limited here.
 - **Firestore cost:** each allowed request still reads up to 2,000 comment
   docs; the request quota bounds this per user.
-- **Prompt injection:** comment text still reaches the model; validation
-  checks shape and length, not meaning.
+- **Prompt injection:** comment text still reaches the model. Since Phase
+  3B (`ANALYSIS_VERSION = "phase3b-1"`), the instructions are in the system
+  message and forum text goes in only as JSON inside one `<forum_data>`
+  block, with `<` escaped so it can't close the block. The system message
+  says that block is material to analyze, never instructions. Validation
+  still checks shape and length, not meaning, so a determined comment can
+  still color the summary's wording.
 - **Rules:** the new collections rely on Phase 3 rules staying closed to
   clients (today's deny-all rules already do this).
 - **Admins:** no account has the `admin` claim yet.

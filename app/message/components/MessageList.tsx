@@ -10,6 +10,7 @@ import type { MessageFilters } from '../services/MessageService';
 import { MessageService } from '../services/MessageService';
 import { MessageItem } from './MessageItem';
 import TeaModal from './TeaModal';
+import { errorCode } from '../../firebase/error-code';
 
 interface MessageListProps {
   filters?: MessageFilters;
@@ -91,7 +92,7 @@ export const MessageList: React.FC<MessageListProps> = ({
       const analysis: MessageAnalysisResponse = await response.json();
       onAnalysisComplete?.(analysis);
     } catch (err) {
-      console.error('Message analysis failed:', err);
+      console.error('[MessageList] analysis failed', { code: errorCode(err) });
     } finally {
       setAnalyzing(false);
     }

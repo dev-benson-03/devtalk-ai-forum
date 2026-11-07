@@ -1,5 +1,4 @@
 import {
-  addDoc,
   collection,
   deleteDoc,
   doc,
@@ -13,7 +12,16 @@ import {
 import { useCallback, useEffect, useState } from 'react';
 // @ts-ignore
 import { db } from '../firebase';
-import { createCommentRecord, listedForumsQuery } from './forum-data';
+import { errorCode } from '../firebase/error-code';
+import {
+  PublishError,
+  publishComment,
+  publishForum,
+  type CommentSubmission,
+  type ForumSubmission,
+  type PublishResult,
+} from '../forum/publish-client';
+import { listedForumsQuery } from './forum-data';
 
 // Types for our forum data structure
 export interface Forum {
@@ -57,16 +65,26 @@ export interface Vote {
   createdAt: Timestamp;
 }
 
+/** A safe error category for logs: a Firebase or publish code, never a message or payload. */
+const errorCategory = (error: unknown): string =>
+  error instanceof PublishError ? `publish/${error.kind}${error.status ? `-${error.status}` : ''}` : errorCode(error);
+
+/** Structured browser diagnostics: operation, safe IDs, counts, codes. No content. */
+export function logFirestoreError(operation: string, error: unknown, fields: Record<string, unknown> = {}) {
+  console.error(`[${operation}] failed`, { ...fields, code: errorCategory(error) });
+}
+
 export function useFirestore() {
   // Forum operations
-  const createForum = async (forumData: Omit<Forum, 'id' | 'createdAt' | 'upvotes' | 'downvotes' | 'commentCount'>) => {
-    console.log("[createForum] Attempting to add forum:", forumData);
+  // New forums are published by the server (moderation, then an Admin SDK write)
+  const createForum = async (forum: ForumSubmission): Promise<PublishResult> => {
+    const started = Date.now();
     try {
-      const docRef = await addDoc(collection(db, 'forums'), forumData);
-      console.log("[createForum] Forum created with ID:", docRef.id);
-      return docRef.id;
+      const result = await publishForum(forum);
+      console.info('[createForum] published', { forumId: result.id, elapsedMs: Date.now() - started });
+      return result;
     } catch (error) {
-      console.error("[createForum] Error adding forum:", error);
+      logFirestoreError('createForum', error, { elapsedMs: Date.now() - started });
       throw error;
     }
   };
@@ -76,7 +94,7 @@ export function useFirestore() {
       const forumRef = doc(db, 'forums', forumId);
       await updateDoc(forumRef, updates);
     } catch (error) {
-      console.error('Error updating forum:', error);
+      logFirestoreError('updateForum', error, { forumId });
       throw error;
     }
   };
@@ -85,18 +103,19 @@ export function useFirestore() {
     try {
       await deleteDoc(doc(db, 'forums', forumId));
     } catch (error) {
-      console.error('Error deleting forum:', error);
+      logFirestoreError('deleteForum', error, { forumId });
       throw error;
     }
   };
 
   // Comment operations
-  // Comment + commentCount in one transaction (see createCommentRecord for why)
-  const createComment = async (commentData: Omit<Comment, 'id' | 'createdAt' | 'upvotes' | 'downvotes'>) => {
+  // Comments are published by the server, which also updates commentCount
+  const createComment = async (comment: CommentSubmission): Promise<PublishResult> => {
+    const started = Date.now();
     try {
-      return await createCommentRecord(db, commentData);
+      return await publishComment(comment);
     } catch (error) {
-      console.error('Error creating comment:', error);
+      logFirestoreError('createComment', error, { forumId: comment.forumId, elapsedMs: Date.now() - started });
       throw error;
     }
   };
@@ -110,7 +129,7 @@ export function useFirestore() {
       }
       return null;
     } catch (error) {
-      console.error('Error fetching forum:', error);
+      logFirestoreError('getForum', error, { forumId });
       throw error;
     }
   }, []);
@@ -146,7 +165,6 @@ export function useForums() {
             id: doc.id,
             ...doc.data()
           })) as Forum[];
-          console.log(forumsData);
      
              // Filter active forums based on flags + time
           const activeForums = forumsData.filter((forum) => {
@@ -177,13 +195,13 @@ export function useForums() {
           setError(null);
           setLoading(false);
         } catch (err) {
-          console.error('Error processing forums data:', err);
+          logFirestoreError('useForums', err, { count: snapshot.size });
           setError('Failed to load forums');
           setLoading(false);
         }
       },
       (err) => {
-        console.error('Error fetching forums:', err);
+        logFirestoreError('useForums', err);
         setError('Failed to connect to database');
         setLoading(false);
       }
@@ -233,13 +251,13 @@ export function useComments(forumId: string) {
           setError(null);
           setLoading(false);
         } catch (err) {
-          console.error('Error processing comments data:', err);
+          logFirestoreError('useComments', err, { forumId, count: snapshot.size });
           setError('Failed to load comments');
           setLoading(false);
         }
       },
       (err) => {
-        console.error('Error fetching comments:', err);
+        logFirestoreError('useComments', err, { forumId });
         setError('Failed to connect to database');
         setLoading(false);
       }
@@ -277,7 +295,7 @@ export function useForum(forumId: string) {
           setError("Forum not found");
         }
       } catch (err) {
-        console.error('Error fetching forum:', err);
+        logFirestoreError('useForum', err, { forumId });
         setForum(null);
         setError('Failed to load forum');
       } finally {

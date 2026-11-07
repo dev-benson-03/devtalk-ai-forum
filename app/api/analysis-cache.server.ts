@@ -19,7 +19,7 @@ import type { TrustedComment } from "./analysis-comments";
 import { validateAnalysisText, type AnalysisText } from "./analysis-output";
 
 /** Bump when the prompt, model settings or output validation change; old entries stop matching. */
-export const ANALYSIS_VERSION = "phase2c-1";
+export const ANALYSIS_VERSION = "phase3b-1";
 export const ANALYSIS_MODEL = "gpt-4o-mini";
 export const ANALYSIS_TEMPERATURE = 0.3;
 export const CACHE_COLLECTION = "analysisCache";

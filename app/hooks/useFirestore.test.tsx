@@ -22,6 +22,23 @@ jest.mock('firebase/firestore', () => ({
 
 jest.mock('../firebase', () => ({ db: {} }));
 
+const mockPublishForum = jest.fn();
+const mockPublishComment = jest.fn();
+jest.mock('../forum/publish-client', () => {
+  class PublishError extends Error {
+    constructor(readonly kind: string, readonly status?: number) {
+      super(kind);
+    }
+  }
+  return {
+    PublishError,
+    publishForum: (...args: unknown[]) => mockPublishForum(...args),
+    publishComment: (...args: unknown[]) => mockPublishComment(...args),
+  };
+});
+
+const PRIVATE = 'Private draft words';
+
 function HookTest({ callback }: { callback: (hook: any) => void }) {
   const hook = useFirestore();
   callback(hook);
@@ -29,12 +46,29 @@ function HookTest({ callback }: { callback: (hook: any) => void }) {
 }
 
 describe('useFirestore', () => {
-  it('createForum returns forum id on success', async () => {
+  it('createForum publishes through the server and returns the forum id', async () => {
+    mockPublishForum.mockResolvedValue({ id: 'forum123' });
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
     let hook: any;
     render(<HookTest callback={h => (hook = h)} />);
-    const forumData = { title: 'Test', description: '', question: '', creatorId: 'u1', creatorName: 'User', isActive: true, isAdminDeleted: false, upvotes: 0, downvotes: 0, commentCount: 0, summary: '', actionRoadmap: [], messages: [] };
-    const id = await hook.createForum(forumData);
-    expect(id).toBe('forum123');
+    const submission = { title: PRIVATE, description: 'd', question: 'q', category: 'Other', timeLimitHours: 1, anonymous: true, requestId: 'r' };
+    expect(await hook.createForum(submission)).toEqual({ id: 'forum123' });
+    expect(mockPublishForum).toHaveBeenCalledWith(submission);
+    expect(require('firebase/firestore').addDoc).not.toHaveBeenCalled();
+    expect(JSON.stringify(info.mock.calls)).not.toContain(PRIVATE);
+    info.mockRestore();
+  });
+
+  it('createForum logs only a code when publishing fails', async () => {
+    const { PublishError } = require('../forum/publish-client');
+    mockPublishForum.mockRejectedValue(new PublishError('rejected', 422));
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+    let hook: any;
+    render(<HookTest callback={h => (hook = h)} />);
+    await expect(hook.createForum({ title: PRIVATE })).rejects.toBeInstanceOf(PublishError);
+    expect(error).toHaveBeenCalledWith('[createForum] failed', expect.objectContaining({ code: 'publish/rejected-422' }));
+    expect(JSON.stringify(error.mock.calls)).not.toContain(PRIVATE);
+    error.mockRestore();
   });
 
   it('updateForum calls updateDoc', async () => {
@@ -51,21 +85,25 @@ describe('useFirestore', () => {
     expect(require('firebase/firestore').deleteDoc).toHaveBeenCalled();
   });
 
-  it('createComment writes the comment and count in one transaction', async () => {
-    const firestore = require('firebase/firestore');
-    const tx = {
-      get: jest.fn(async () => ({ exists: () => true, data: () => ({ commentCount: 4 }) })),
-      set: jest.fn(),
-      update: jest.fn(),
-    };
-    firestore.doc.mockImplementation((_db: unknown, col: string, id: string) => ({ col, id }));
-    firestore.runTransaction.mockImplementation(async (_db: unknown, fn: any) => fn(tx));
+  it('createComment publishes through the server, not a browser write', async () => {
+    mockPublishComment.mockResolvedValue({ id: 'c9' });
     let hook: any;
     render(<HookTest callback={h => (hook = h)} />);
-    const id = await hook.createComment({ forumId: 'f1', userId: 'u1', userName: 'Anonymous User', content: 'Hi' });
-    expect(id).toBe('f1_5');
-    expect(tx.set).toHaveBeenCalledWith({ col: 'comments', id: 'f1_5' }, expect.objectContaining({ userId: 'u1', upvotes: 0 }));
-    expect(tx.update).toHaveBeenCalledWith({ col: 'forums', id: 'f1' }, { commentCount: 5 });
+    const comment = { forumId: 'f1', content: 'Hi', anonymous: false, requestId: 'r' };
+    expect(await hook.createComment(comment)).toEqual({ id: 'c9' });
+    expect(mockPublishComment).toHaveBeenCalledWith(comment);
+    expect(require('firebase/firestore').runTransaction).not.toHaveBeenCalled();
+  });
+
+  it('createComment logs the forum ID and a code, never the message', async () => {
+    mockPublishComment.mockRejectedValue(Object.assign(new Error(PRIVATE), { code: 'unavailable' }));
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+    let hook: any;
+    render(<HookTest callback={h => (hook = h)} />);
+    await expect(hook.createComment({ forumId: 'f1', content: PRIVATE, anonymous: true, requestId: 'r' })).rejects.toThrow();
+    expect(error).toHaveBeenCalledWith('[createComment] failed', expect.objectContaining({ forumId: 'f1', code: 'unavailable' }));
+    expect(JSON.stringify(error.mock.calls)).not.toContain(PRIVATE);
+    error.mockRestore();
   });
 
   it('getForum returns forum data if exists', async () => {
@@ -246,7 +284,7 @@ describe('getForum error handling', () => {
     let hook: any;
     render(<HookTest callback={h => (hook = h)} />);
     await expect(hook.getForum('fail')).rejects.toThrow('fail');
-    expect(errorSpy).toHaveBeenCalledWith('Error fetching forum:', expect.any(Error));
+    expect(errorSpy).toHaveBeenCalledWith('[getForum] failed', { forumId: 'fail', code: 'unknown' });
     errorSpy.mockRestore();
   });
 });
