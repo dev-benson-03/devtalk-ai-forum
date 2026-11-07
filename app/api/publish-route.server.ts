@@ -11,6 +11,7 @@ import { requireUser, type AuthenticatedUser } from "../auth/authenticate.server
 import { getAdminDb } from "../firebase/admin.server";
 import { createModerator, ModerationUnavailableError } from "../moderation/moderation.server";
 import { openAIModerationProvider } from "../moderation/openai-provider.server";
+import { PublishLimitStoreError } from "./publish-limits.server";
 import { publishComment, publishForum, type PublishDeps, type PublishOutcome } from "./publish.server";
 import { readJsonBody, validateCommentRequest, validateForumRequest, type Parsed } from "./publish-request";
 
@@ -31,6 +32,9 @@ function safeErrorCode(error: unknown): string {
   if (typeof code === "number") return `firestore/${code}`;
   return typeof code === "string" && /^[a-z]+\/[a-z0-9-]{1,64}$/.test(code) ? code : "unknown";
 }
+
+/** Whole seconds, at least 1, as Retry-After requires. */
+const retryAfterSeconds = (ms: number) => Math.max(1, Math.ceil(ms / 1000));
 
 function toResponse(outcome: PublishOutcome): Response {
   switch (outcome.kind) {
@@ -53,6 +57,12 @@ function toResponse(outcome: PublishOutcome): Response {
       return json({ error: "Forum closed", reason: "forum_closed" }, 409);
     case "request_reused":
       return json({ error: "Invalid request", reason: "request_reused" }, 409);
+    case "rate_limited": {
+      const seconds = retryAfterSeconds(outcome.retryAfterMs);
+      return json({ error: "Too many requests", reason: "rate_limited", retryAfterSeconds: seconds }, 429, {
+        "Retry-After": String(seconds),
+      });
+    }
   }
 }
 
@@ -61,7 +71,9 @@ const logFields = (outcome: PublishOutcome) =>
     ? { id: outcome.id, duplicate: outcome.duplicate }
     : outcome.kind === "rejected"
       ? { reason: outcome.reason, field: outcome.field }
-      : {};
+      : outcome.kind === "rate_limited"
+        ? { reason: "rate_limited", retryAfterSeconds: retryAfterSeconds(outcome.retryAfterMs) }
+        : {};
 
 export interface PublishRouteDeps {
   /** Defaults to the Admin SDK and the OpenAI moderation provider. */
@@ -117,6 +129,11 @@ export async function handlePublish(operation: Operation, request: Request, opti
       // Fail closed: nothing was written
       log("error", `${operation}.moderation_unavailable`, { forumId, reason: error.reason, elapsedMs: elapsedMs() });
       return json({ error: "Publishing unavailable", reason: "moderation_unavailable" }, 503, { "Retry-After": "30" });
+    }
+    if (error instanceof PublishLimitStoreError) {
+      // Fail closed, and never report a storage failure as "over the limit"
+      log("error", `${operation}.rate_limit_unavailable`, { forumId, code: safeErrorCode(error.cause), elapsedMs: elapsedMs() });
+      return json({ error: "Publishing unavailable", reason: "rate_limit_unavailable" }, 503, { "Retry-After": "30" });
     }
     const code = (error as { code?: unknown } | null)?.code;
     log("error", `${operation}.write_failed`, { forumId, code: safeErrorCode(error), elapsedMs: elapsedMs() });

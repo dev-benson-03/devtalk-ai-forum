@@ -1,5 +1,5 @@
 /**
- * The AI analysis collections and the publish receipts are managed only by
+ * The AI analysis collections, publish receipts and publishing limits are managed only by
  * the server (Admin SDK, which bypasses rules). Browsers can neither read
  * nor write them.
  */
@@ -24,6 +24,7 @@ beforeEach(async () => {
     await setDoc(doc(db, "analysisState", "f1"), { lock: null });
     await setDoc(doc(db, "analysisRateLimits", "alice"), { requests: { count: 1 } });
     await setDoc(doc(db, "publishRequests", "abc123"), { uid: "alice", kind: "comment", targetId: "c1" });
+    await setDoc(doc(db, "publishRateLimits", "alice"), { comments: { count: 1 } });
   });
 });
 
@@ -32,6 +33,7 @@ const ids: Record<string, string> = {
   analysisState: "f1",
   analysisRateLimits: "alice",
   publishRequests: "abc123",
+  publishRateLimits: "alice",
 };
 
 describe.each(Object.keys(ids))("%s", (name) => {

@@ -95,4 +95,26 @@ describe("publish client", () => {
       expect(SUPPORT_MESSAGE).not.toMatch(promise);
     }
   });
+
+  it("maps 429 to rate_limited with a bounded wait from the server", async () => {
+    fetchMock.mockResolvedValue(respond(429, { reason: "rate_limited", retryAfterSeconds: 125 }));
+    const error = await publishComment(comment, async () => user()).catch((e) => e);
+    expect(error).toMatchObject({ kind: "rate_limited", status: 429, reason: "rate_limited", retryAfterSeconds: 125 });
+    expect(fetchMock).toHaveBeenCalledTimes(1); // never retried automatically
+    for (const bad of [-5, 0, 1.5, "60", 10 ** 9, undefined]) {
+      fetchMock.mockResolvedValue(respond(429, { reason: "rate_limited", retryAfterSeconds: bad }));
+      expect((await publishComment(comment, async () => user()).catch((e) => e)).retryAfterSeconds).toBeUndefined();
+    }
+  });
+
+  it.each([
+    [undefined, "You're posting faster than DevTalk allows. Your draft is still here, so please try again later."],
+    [20, "You're posting faster than DevTalk allows. Your draft is still here, so please try again in about 20 seconds."],
+    [61, "You're posting faster than DevTalk allows. Your draft is still here, so please try again in about 2 minutes."],
+    [60, "You're posting faster than DevTalk allows. Your draft is still here, so please try again in about 1 minute."],
+    [3 * 3600, "You're posting faster than DevTalk allows. Your draft is still here, so please try again in about 3 hours."],
+  ])("explains when to retry after %s seconds", (seconds, message) => {
+    const error = new PublishError("rate_limited", 429, "rate_limited", undefined, false, seconds);
+    expect(publishErrorMessage(error, "x")).toBe(message);
+  });
 });

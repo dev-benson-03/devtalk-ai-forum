@@ -141,4 +141,21 @@ describe("ForumDetailPage comment publishing", () => {
     await waitFor(() => expect(global.alert).toHaveBeenCalledWith(expect.stringContaining(SUPPORT_MESSAGE)));
     expect(box()).toHaveValue("A draft");
   });
+
+  it("keeps the draft and its request ID after a rate limit, says when to retry and does not retry by itself", async () => {
+    mockCreateComment
+      .mockRejectedValueOnce(new PublishError("rate_limited", 429, "rate_limited", undefined, false, 300))
+      .mockResolvedValue({ id: "c1" });
+    renderPage();
+    send("Posting quickly");
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith(expect.stringMatching(/try again in about 5 minutes/)));
+    expect(box()).toHaveValue("Posting quickly");
+    expect(mockCreateComment).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: /send message/i })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /send message/i }));
+    await waitFor(() => expect(box()).toHaveValue(""));
+    const [first, second] = mockCreateComment.mock.calls.map(([arg]) => arg.requestId);
+    expect(second).toBe(first);
+  });
 });

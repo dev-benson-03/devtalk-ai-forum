@@ -6,8 +6,10 @@
  *   1. Duplicate check: was this requestId already used? Only the identical
  *      submission (same SHA-256 digest) counts as a duplicate.
  *   2. Forum state check (comments): exists, visible, open
- *   3. Moderation of every publishable text, outside any transaction
- *   4. One transaction that re-checks the duplicate and the forum state,
+ *   3. Admission: the user's publishing allowance (publish-limits.server.ts),
+ *      in its own transaction. Counted even if later steps reject or fail.
+ *   4. Moderation of every publishable text, outside any transaction
+ *   5. One transaction that re-checks the duplicate and the forum state,
  *      then writes the document, the publish receipt and (comments) the
  *      forum's commentCount together.
  *
@@ -21,6 +23,7 @@ import { canViewForum } from "../auth/forum-access";
 import { ANONYMOUS_NAME, TEXT_LIMITS } from "../forum/forum-options";
 import type { ModerationField, Moderator } from "../moderation/moderation.server";
 import type { PolicyReason } from "../moderation/policy.server";
+import { admitPublish } from "./publish-limits.server";
 import type { CommentRequest, ForumRequest } from "./publish-request";
 
 type Firestore = ReturnType<typeof import("../firebase/admin.server").getAdminDb>;
@@ -37,7 +40,8 @@ export type PublishOutcome =
   | { kind: "not_found" }
   | { kind: "forbidden" }
   | { kind: "closed" }
-  | { kind: "request_reused" };
+  | { kind: "request_reused" }
+  | { kind: "rate_limited"; retryAfterMs: number };
 
 export interface PublishDeps {
   db: Firestore;
@@ -118,13 +122,20 @@ const receipt = (uid: string, kind: "forum" | "comment", digest: string, targetI
   expiresAt: Timestamp.fromMillis(now.getTime() + RECEIPT_TTL_MS),
 });
 
+/** Throws PublishLimitStoreError if the allowance can't be read or updated. */
+async function admission(db: Firestore, uid: string, kind: "forum" | "comment", now: Date): Promise<PublishOutcome | null> {
+  const admitted = await admitPublish(db, uid, kind, now.getTime());
+  return admitted.ok ? null : { kind: "rate_limited", retryAfterMs: admitted.retryAfterMs };
+}
+
 /** Identity text that will be shown publicly is moderated too. */
 const withName = (fields: ModerationField[], name: string, anonymous: boolean): ModerationField[] =>
   anonymous ? fields : [...fields, { name: "displayName", text: name }];
 
 /**
  * Publishes a new forum. Throws ModerationUnavailableError when moderation
- * can't run (nothing is written) and Firestore errors as they come.
+ * can't run, PublishLimitStoreError when the allowance can't be checked
+ * (nothing is written in either case) and Firestore errors as they come.
  */
 export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, input: ForumRequest): Promise<PublishOutcome> {
   const { db, moderator } = deps;
@@ -134,6 +145,8 @@ export async function publishForum(deps: PublishDeps, user: AuthenticatedUser, i
 
   const earlier = fromReceipt(checkReceipt((await receiptRef.get()).data(), "forum", digest));
   if (earlier) return earlier;
+  const limited = await admission(db, user.uid, "forum", now);
+  if (limited) return limited;
 
   const creatorName = displayNameFor(user, input.anonymous);
   const decision = await moderator.moderate(
@@ -203,6 +216,8 @@ export async function publishComment(deps: PublishDeps, user: AuthenticatedUser,
   if (earlier) return earlier;
   const blocked = forumGate(user, (await forumRef.get()).data(), clock());
   if (blocked) return blocked;
+  const limited = await admission(db, user.uid, "comment", clock());
+  if (limited) return limited;
 
   const userName = displayNameFor(user, input.anonymous);
   const decision = await moderator.moderate(withName([{ name: "content", text: input.content }], userName, input.anonymous));

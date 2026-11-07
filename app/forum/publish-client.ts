@@ -30,6 +30,7 @@ export interface CommentSubmission {
 export type PublishErrorKind =
   | "rejected" // moderation: revise and resubmit
   | "unavailable" // moderation or storage down: retry later
+  | "rate_limited" // the user's publishing allowance is used up: wait, then resend
   | "closed"
   | "signed_out"
   | "failed";
@@ -59,7 +60,9 @@ export class PublishError extends Error {
     readonly reason?: string,
     readonly field?: string,
     /** Show SUPPORT_MESSAGE with the rejection. */
-    readonly support = false
+    readonly support = false,
+    /** rate_limited: how long the server asked to wait, when it said. */
+    readonly retryAfterSeconds?: number
   ) {
     super(`Publish failed: ${kind}`);
     this.name = "PublishError";
@@ -84,6 +87,10 @@ export const newRequestId = (): string => crypto.randomUUID();
 /** The anonymous preference from the dashboard toggle; anonymous unless turned off. */
 export const prefersAnonymous = (): boolean =>
   typeof window === "undefined" || window.sessionStorage.getItem("anonymous") !== "false";
+
+/** A whole number of seconds up to one day, or undefined. */
+const waitSeconds = (value: unknown) =>
+  Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 86_400 ? (value as number) : undefined;
 
 const textField = (value: unknown) => (typeof value === "string" && /^[a-zA-Z_]{1,32}$/.test(value) ? value : undefined);
 
@@ -117,13 +124,21 @@ async function send(path: string, body: unknown, getUser: () => Promise<User | n
     return { id: result.id, ...(result.support === true ? { support: true } : {}) };
   }
 
-  const details = (await response.json().catch(() => ({}))) as { reason?: unknown; field?: unknown; support?: unknown };
+  const details = (await response.json().catch(() => ({}))) as {
+    reason?: unknown;
+    field?: unknown;
+    support?: unknown;
+    retryAfterSeconds?: unknown;
+  };
   const reason = textField(details.reason);
   const field = textField(details.field);
   const status = response.status;
   if (status === 401) throw new PublishError("signed_out", status);
   if (status === 422) throw new PublishError("rejected", status, reason, field, details.support === true);
   if (status === 409 && reason === "forum_closed") throw new PublishError("closed", status, reason);
+  if (status === 429) {
+    throw new PublishError("rate_limited", status, reason, undefined, false, waitSeconds(details.retryAfterSeconds));
+  }
   if (status === 503) throw new PublishError("unavailable", status, reason);
   throw new PublishError("failed", status, reason, field);
 }
@@ -151,6 +166,13 @@ const REASON_LABELS: Record<string, string> = {
   unsafe: "unsafe content",
 };
 
+/** "about 5 minutes": rounded up, in the largest whole unit. */
+function roughWait(seconds: number): string {
+  const [amount, unit] =
+    seconds < 60 ? [seconds, "second"] : seconds < 3600 ? [Math.ceil(seconds / 60), "minute"] : [Math.ceil(seconds / 3600), "hour"];
+  return `about ${amount} ${unit}${amount === 1 ? "" : "s"}`;
+}
+
 /** A short, respectful message for an alert. Never includes server details. */
 export function publishErrorMessage(error: unknown, fallback: string): string {
   if (!(error instanceof PublishError)) return fallback;
@@ -167,6 +189,10 @@ export function publishErrorMessage(error: unknown, fallback: string): string {
     }
     case "unavailable":
       return "Publishing is temporarily unavailable. Your draft is still here, so you can try again in a moment.";
+    case "rate_limited": {
+      const when = error.retryAfterSeconds ? `in ${roughWait(error.retryAfterSeconds)}` : "later";
+      return `You're posting faster than DevTalk allows. Your draft is still here, so please try again ${when}.`;
+    }
     case "closed":
       return "This forum has closed and no longer accepts new messages.";
     case "signed_out":
