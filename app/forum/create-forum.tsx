@@ -5,7 +5,7 @@ import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useFirestore } from "../hooks/useFirestore";
 import { FORUM_CATEGORIES, FORUM_TIME_LIMITS } from "./forum-options";
-import { newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
+import { isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function CreateForumPage() {
     const { createForum } = useFirestore();
@@ -58,6 +58,7 @@ export default function CreateForumPage() {
             window.location.href = '/forums';
         } catch (error) {
             // The draft stays in the form so it can be revised and resubmitted
+            if (isRequestReused(error)) requestId.current = null;
             alert(publishErrorMessage(error, "Failed to create forum. Please try again."));
         } finally {
             setIsLoading(false);

@@ -51,6 +51,13 @@ async function currentUser(): Promise<User | null> {
   return firebaseAuth.currentUser;
 }
 
+/**
+ * True when the server says this draft's requestId already published a
+ * different submission. The page then starts a new ID for the next send.
+ */
+export const isRequestReused = (error: unknown): boolean =>
+  error instanceof PublishError && error.reason === "request_reused";
+
 /** New ID for a draft. */
 export const newRequestId = (): string => crypto.randomUUID();
 

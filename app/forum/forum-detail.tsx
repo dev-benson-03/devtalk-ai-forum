@@ -6,7 +6,7 @@ import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
-import { newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
+import { isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -64,6 +64,7 @@ export default function ForumDetailPage() {
             draftRequestId.current = null;
         } catch (error) {
             // The draft stays in the box so it can be revised and resent
+            if (isRequestReused(error)) draftRequestId.current = null;
             alert(publishErrorMessage(error, "Failed to post message. Please try again."));
         } finally {
             setIsSubmitting(false);

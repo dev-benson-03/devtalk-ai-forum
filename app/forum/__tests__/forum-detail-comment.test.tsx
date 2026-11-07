@@ -100,6 +100,17 @@ describe("ForumDetailPage comment publishing", () => {
     expect(ids[2]).not.toBe(ids[0]);
   });
 
+  it("starts a new request ID after the server reports the old one was used for different content", async () => {
+    mockCreateComment.mockRejectedValueOnce(new PublishError("failed", 409, "request_reused")).mockResolvedValue("c2");
+    renderPage();
+    send("Edited after a lost response");
+    await waitFor(() => expect(global.alert).toHaveBeenCalledWith("Failed to post message. Please try again."));
+    fireEvent.click(screen.getByRole("button", { name: /send message/i }));
+    await waitFor(() => expect(mockCreateComment).toHaveBeenCalledTimes(2));
+    const [first, second] = mockCreateComment.mock.calls.map(([arg]) => arg.requestId);
+    expect(second).not.toBe(first);
+  });
+
   it("tells the user when the forum closed in the meantime", async () => {
     mockCreateComment.mockRejectedValue(new PublishError("closed", 409, "forum_closed"));
     renderPage();
