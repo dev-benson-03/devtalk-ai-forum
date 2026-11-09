@@ -22,6 +22,7 @@ import {
   type PublishResult,
 } from '../forum/publish-client';
 import { listedForumsQuery } from './forum-data';
+import { byDocumentId, compareStoredDates } from '../forum/stored-time';
 
 // Types for our forum data structure
 export interface Forum {
@@ -159,37 +160,17 @@ export function useForums() {
       forumsQuery,
       (snapshot) => {
         try {
-          const now = Date.now();
-
           const forumsData = snapshot.docs.map(doc => ({
             id: doc.id,
             ...doc.data()
           })) as Forum[];
-     
-             // Filter active forums based on flags + time
-          const activeForums = forumsData.filter((forum) => {
-          const isActive = forum.isActive ?? true;
-          const notDeleted = !(forum.isAdminDeleted ?? false);
 
-            // Convert Firestore Timestamp to millis if present
-            const endMs =
-              forum.endTime instanceof Timestamp
-                ? forum.endTime.toMillis()
-                : typeof forum.endTime === "string"
-                ? Date.parse(forum.endTime)
-                : 0;
+          // The query already returns only listed forums; this keeps the
+          // legacy defaults (missing isActive = active, missing isAdminDeleted = not deleted)
+          const activeForums = forumsData.filter((forum) => (forum.isActive ?? true) && !(forum.isAdminDeleted ?? false));
 
-            //const withinTime = endMs === 0 || endMs > now;
-            return isActive && notDeleted;
-          });
-
-          // Sort client-side by soonest ending (optional)
-          activeForums.sort(
-            (a, b) =>
-              (a.endTime?.toMillis?.() ?? 0) - (b.endTime?.toMillis?.() ?? 0)
-          );
-
-          
+          // Soonest ending first; unreadable or missing end times first, then by ID
+          activeForums.sort((a, b) => compareStoredDates(a.endTime, b.endTime) || byDocumentId(a, b));
 
           setForums(activeForums);
           setError(null);
@@ -240,12 +221,10 @@ export function useComments(forumId: string) {
             ...doc.data()
           })) as Comment[];
           
-          // Sort by creation time on the client side
-          const sortedComments = commentsData.sort((a, b) => {
-            const aTime = a.createdAt?.toDate?.() || new Date(0);
-            const bTime = b.createdAt?.toDate?.() || new Date(0);
-            return aTime.getTime() - bTime.getTime();
-          });
+          // Oldest first; unreadable or missing dates first, then by ID
+          const sortedComments = commentsData.sort(
+            (a, b) => compareStoredDates(a.createdAt, b.createdAt) || byDocumentId(a, b)
+          );
           
           setComments(sortedComments);
           setError(null);
