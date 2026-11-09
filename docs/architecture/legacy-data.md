@@ -13,7 +13,7 @@ the safeguards at the end).
 | 1 | `commentCount` drift | Before Phase 3A the comment and the `increment(1)` were two separate writes, so a failure between them lost a count. An admin comment delete (rules allow it) doesn't decrement. | The forum list and forum page show "N responses" from `commentCount`, so the number can be wrong. Publishing is unaffected: the server reads the stored count and adds 1. What's Tea counts real comments itself. |
 | 2 | Forums missing `isActive` / `isAdminDeleted` | Created before those fields existed | Not in the forum list: the list query needs both fields, and rules are not filters. Still opens by direct link. The server treats missing flags as active and not deleted, so they still accept comments. |
 | 3 | Comment IDs | Old comments have random IDs. Phase 3A browser comments used `<forumId>_<n>`. | **No longer a risk.** The server publishes with random IDs and never needs the old scheme. Reads use `where forumId ==` and don't depend on the ID. |
-| 4 | `endTime` values that aren't Timestamps (e.g. ISO strings), or missing | Older client code | String `endTime`: the server and the old rules treat the forum as closed, and `forum-detail.tsx` / `forumspage.tsx` call `endTime.toDate()`, which throws on a string (existing bug). Missing `endTime`: the forum stays open. |
+| 4 | `endTime` values that aren't Timestamps (e.g. ISO strings), or missing | Older client code | String `endTime`: the server and the old rules treat the forum as closed. The views read dates through `app/forum/stored-time.ts`, so a string or malformed value no longer crashes them (it used to, through `endTime.toDate()`). Missing `endTime`: the forum stays open. |
 | 5 | Content never moderated | Published before this policy | Shown to everyone and fed to What's Tea. New posts are moderated; old ones are not. |
 | 6 | Comments without `forumId` | Unknown older shape | The rules can't authorize reading them (the read rule needs the parent forum), so they never appear. |
 
@@ -91,6 +91,25 @@ separately from the per-category counts.
 | `comment_forum_id_invalid` | manual review | Missing, empty or not a string |
 | `comment_orphaned` | manual review | The forum doesn't exist. No parent is inferred and nothing is deleted. |
 | `comment_moderation_unknown` / `_unrecognized` | report only | As for forums |
+
+**How the app reads legacy dates** (`app/forum/stored-time.ts`, browser-only):
+- **Dates shown:** a Timestamp, or a string under the `endTime` string contract
+  below (a test checks the two parsers agree). Anything else shows
+  "Unknown date", never "Invalid Date".
+- **Open or closed:** the same rule as the server's `acceptsComments`. No
+  `endTime` means open; a Timestamp means open until that instant; anything
+  else, including `null` and a valid ISO string, means closed and shows
+  "Not accepting new messages". The server still decides.
+- **Expiry, not visibility:** this only decides whether a forum takes new
+  messages, from `endTime`. Who can see a forum is decided separately by
+  `isActive` and `isAdminDeleted` (Firestore rules, the listed-forums query
+  and `canViewForum`), and this change leaves that alone. A closed forum,
+  including one with an unreadable `endTime`, stays viewable with its
+  messages and What's Tea. A hidden or admin-deleted forum stays hidden
+  whatever its `endTime` says. The server's `acceptsComments` also refuses
+  comments on inactive or deleted forums.
+- **Order:** unreadable dates sort first (where the old epoch-0 fallback put
+  them), with the document ID as the tie-breaker.
 
 **`endTime` string contract:** only `YYYY-MM-DDTHH:mm[:ss[.fff]]` followed
 by `Z` or `±HH:MM` is accepted.

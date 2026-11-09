@@ -7,6 +7,7 @@ import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
 import { SUPPORT_MESSAGE, isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
+import { forumWindow, storedDateText } from "./stored-time";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -38,11 +39,8 @@ export default function ForumDetailPage() {
         if (!newMessage.trim() || !forumId || !forum) return;
 
         
-        // Check if forum is still active
-        const endTime = forum.endTime?.toDate();
-        const isExpired = endTime && new Date() > endTime;
-        
-        if (isExpired) {
+        // Same rule as the server, which still makes the final decision
+        if (!forumWindow(forum.endTime, new Date()).accepting) {
             alert("This forum has closed and no longer accepts new messages.");
             return;
         }
@@ -126,10 +124,8 @@ export default function ForumDetailPage() {
         );
     }
 
-    const createdAt = forum.createdAt?.toDate();
-    const endTime = forum.endTime?.toDate();
-    const isExpired = endTime && new Date() > endTime;
-    const status = isExpired ? "Closed" : "Open";
+    const { accepting, end } = forumWindow(forum.endTime, new Date());
+    const status = accepting ? "Open" : "Closed";
 
     return (
         <div className="min-h-screen flex flex-col">
@@ -182,7 +178,7 @@ export default function ForumDetailPage() {
 
                         <div className="flex justify-between items-center text-sm text-gray-500 ">
                             <div>
-                                Created by {forum.creatorName} • {createdAt ? createdAt.toLocaleDateString() : 'Unknown date'}
+                                Created by {forum.creatorName} • {storedDateText(forum.createdAt, "date")}
                             </div>
                             <div className="flex gap-4">
                                 <span>{forum.commentCount || 0} responses</span>
@@ -191,10 +187,12 @@ export default function ForumDetailPage() {
                             </div>
                         </div>
 
-                        {endTime && (
+                        {end ? (
                             <div className="mt-3 text-sm text-gray-600 ">
-                                {isExpired ? 'Forum closed' : 'Forum closes'} on {endTime.toLocaleDateString()} at {endTime.toLocaleTimeString()}
+                                {accepting ? 'Forum closes' : 'Forum closed'} on {end.toLocaleDateString()} at {end.toLocaleTimeString()}
                             </div>
+                        ) : !accepting && (
+                            <div className="mt-3 text-sm text-gray-600 ">Not accepting new messages</div>
                         )}
                         <button
                           onClick={() => {
@@ -247,7 +245,7 @@ export default function ForumDetailPage() {
                                                         {comment.userName}
                                                     </p>
                                                     <p className="text-xs text-gray-500 ">
-                                                        {comment.createdAt?.toDate().toLocaleString()}
+                                                        {storedDateText(comment.createdAt, "dateTime")}
                                                     </p>
                                                 </div>
                                             </div>
@@ -273,7 +271,7 @@ export default function ForumDetailPage() {
                     </div>
 
                     {/* New Message Form */}
-                    {!isExpired && (
+                    {accepting && (
                         <div className="bg-white  rounded-xl border border-gray-200  p-6 mt-6">
                             <h2 className="text-2xl font-bold text-gray-900  mb-4">
                                 {comments.length > 0 ? "Reply to this forum" : "Be the first to comment"}

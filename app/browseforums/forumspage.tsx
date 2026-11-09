@@ -6,6 +6,7 @@ import { Footer } from "../components/footer/footer";
 import { NavBar } from "../components/navbar/navbar";
 import { firebaseAuth } from "../firebase";
 import { useForums } from "../hooks/useFirestore";
+import { forumWindow, storedDateText } from "../forum/stored-time";
 
 export function ForumsPage() {
   const { forums, loading, error } = useForums();
@@ -39,23 +40,23 @@ export function ForumsPage() {
   }, []);
 
   // Filter forums based on selected filters
+  // "Open" means the server would accept a message now (see forumWindow)
+  const now = new Date();
+  const statusOf = (forum: { endTime?: unknown }) => (forumWindow(forum.endTime, now).accepting ? "Open" : "Closed");
   const filteredForums = forums.filter(forum => {
-    const endTime = forum.endTime?.toDate();
-    const isExpired = endTime && new Date() > endTime;
-    const status = isExpired ? "Closed" : "Open";
+    const status = statusOf(forum);
     const matchesCategory = selectedCategory === "All" || (forum.tags && forum.tags.includes(selectedCategory));
     const matchesStatus = selectedStatus === "All" || status === selectedStatus;
     return matchesCategory && matchesStatus;
   });
 
   // Sort forums so open forums appear first
+  // Stable sort: the hook's order is kept within each group
   const sortedForums = [...filteredForums].sort((a, b) => {
-    const aEnd = a.endTime?.toDate();
-    const bEnd = b.endTime?.toDate();
-    const aExpired = aEnd && new Date() > aEnd;
-    const bExpired = bEnd && new Date() > bEnd;
-    if (aExpired === bExpired) return 0;
-    return aExpired ? 1 : -1;
+    const aClosed = statusOf(a) === "Closed";
+    const bClosed = statusOf(b) === "Closed";
+    if (aClosed === bClosed) return 0;
+    return aClosed ? 1 : -1;
   });
 
   // Handler for radio button toggle (allows deselect)
@@ -228,10 +229,8 @@ export function ForumsPage() {
             ) : (
               <ul className="space-y-6">
                 {sortedForums.map((forum) => {
-                  const createdAt = forum.createdAt?.toDate();
-                  const endTime = forum.endTime?.toDate();
-                  const isExpired = endTime && new Date() > endTime;
-                  const status = isExpired ? "Closed" : "Open";
+                  const { accepting, end } = forumWindow(forum.endTime, now);
+                  const status = accepting ? "Open" : "Closed";
                   return (
                     <li key={forum.id}>
                       <Link
@@ -260,7 +259,7 @@ export function ForumsPage() {
                         </p>
                         <div className="flex justify-between items-center text-sm text-gray-500 dark:text-gray-400">
                           <div>
-                            By {forum.creatorName} • {createdAt ? createdAt.toLocaleDateString() : 'Unknown date'}
+                            By {forum.creatorName} • {storedDateText(forum.createdAt, "date")}
                           </div>
                           <div className="flex gap-4">
                             <span>{forum.commentCount || 0} responses</span>
@@ -268,10 +267,12 @@ export function ForumsPage() {
                             <span>↓ {forum.downvotes || 0}</span>
                           </div>
                         </div>
-                        {forum.endTime && (
+                        {end ? (
                           <div className="mt-2 text-xs text-gray-400">
-                            {isExpired ? 'Closed' : 'Closes'} on {endTime ? endTime.toLocaleDateString() : ''} at {endTime ? endTime.toLocaleTimeString() : ''}
+                            {accepting ? 'Closes' : 'Closed'} on {end.toLocaleDateString()} at {end.toLocaleTimeString()}
                           </div>
+                        ) : !accepting && (
+                          <div className="mt-2 text-xs text-gray-400">Not accepting new messages</div>
                         )}
                       </Link>
                     </li>
