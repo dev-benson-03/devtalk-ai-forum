@@ -223,6 +223,56 @@ transaction.
 | Signed out or expired token | 401 | `{ error }` | One retry with a fresh token, then "Please sign in again to post." |
 | Bad input | 400 / 413 | `{ reason, field? }` | Generic failure alert (the form prevents this) |
 
+### Viewing versus posting on the forum page
+
+**Who can view a forum and whether it accepts comments are separate rules.**
+- **Viewing:** `canViewForum` and `firestore.rules` decide this. Hidden
+  forums (`isActive === false`) are open to their creator and admins.
+  Admin-deleted forums are open to admins. They aren't invisible to
+  everyone.
+- **Posting:** the server's `acceptsComments` decides this, checked after
+  viewing. A creator or admin can therefore view a forum that takes no new
+  messages. There is no posting exception for either.
+
+| Forum state | New comments |
+| --- | --- |
+| `isAdminDeleted === true` | Unavailable |
+| `isActive === false` | Unavailable |
+| Missing flags, or any other value (for example `"false"`, `null`, `1`) | These flag values do not independently block posting; expiry still applies. (Such a forum is still not listed: the list query requires stored `isActive == true` and `isAdminDeleted == false`.) |
+| `endTime` missing | Available |
+| `endTime` a Timestamp after now | Available |
+| `endTime` a Timestamp at or before now | Unavailable |
+| `endTime` a string, `null` or another type | Unavailable |
+
+**How the forum page mirrors this:** `postingEligibility`, in
+`app/forum/posting-eligibility.ts`, is a browser-safe copy of the server's
+rule. It uses the same exact comparisons and reuses `forumWindow` for the
+end time.
+- **Parity test:** a test runs it and the server's `acceptsComments` over
+  72 synthetic combinations and requires identical answers.
+- **When posting is unavailable:**
+  - the page shows "Closed" and "Not accepting new messages";
+  - it shows no "closes on" date for a hidden or deleted forum;
+  - messages, forum details and What's Tea stay available to anyone allowed
+    to view the forum.
+- **Submit-time check:** the page applies the same rule again just before
+  sending. A blocked send:
+  - makes no request;
+  - keeps the draft and its request ID;
+  - explains why, in safe wording.
+- **Drafts:** a draft typed before posting became unavailable stays visible,
+  read-only, with the Send button disabled. If the forum becomes available
+  again, the same draft is sent with the same request ID.
+- **The server still decides:** a 409 or 403 after a locally permitted send
+  is handled as in the table above, and the draft stays.
+
+**Limitation: the forum isn't realtime.** The page loads the forum once
+(`getDoc`) and doesn't subscribe to changes. If someone hides or deletes it
+while the page is open, the page still shows it as open until it is
+reloaded. The submit-time check catches end-time expiry because it uses the
+current clock. A visibility change made elsewhere is caught only by the
+server's response.
+
 - **No redesign:** pages use the same `alert()` they used before for
   errors, with clearer wording.
 - **Unchanged UI:** the forum page, buttons, theme and What's Tea modal

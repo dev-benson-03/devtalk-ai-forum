@@ -100,14 +100,15 @@ separately from the per-category counts.
   `endTime` means open; a Timestamp means open until that instant; anything
   else, including `null` and a valid ISO string, means closed and shows
   "Not accepting new messages". The server still decides.
-- **Expiry, not visibility:** this only decides whether a forum takes new
-  messages, from `endTime`. Who can see a forum is decided separately by
-  `isActive` and `isAdminDeleted` (Firestore rules, the listed-forums query
-  and `canViewForum`), and this change leaves that alone. A closed forum,
-  including one with an unreadable `endTime`, stays viewable with its
-  messages and What's Tea. A hidden or admin-deleted forum stays hidden
-  whatever its `endTime` says. The server's `acceptsComments` also refuses
-  comments on inactive or deleted forums.
+- **Expiry, not visibility:** `forumWindow` only reads `endTime`. On the
+  forum page, `postingEligibility` combines it with the hidden and deleted
+  flags, as the server's `acceptsComments` does (see "Viewing versus
+  posting" in `publishing.md`). Who can see a forum is decided separately
+  by `isActive` and `isAdminDeleted` (Firestore rules, the listed-forums
+  query and `canViewForum`). A closed forum, including one with an
+  unreadable `endTime`, stays viewable with its messages and What's Tea. A
+  hidden or admin-deleted forum stays hidden from the list whatever its
+  `endTime` says.
 - **Order:** unreadable dates sort first (where the old epoch-0 fallback put
   them), with the document ID as the tie-breaker.
 
