@@ -144,6 +144,194 @@ published or deleted during or after the scan make a proposed
 is a plan, not a source of truth, until each value is re-checked at write
 time (below).
 
+## Visibility-flag rehearsal (emulator only)
+
+`scripts/visibility-rehearsal/` rehearses one narrow correction against the
+Firestore **emulator** with synthetic data. It proves that missing
+visibility flags can be backed up, corrected, verified and rolled back
+safely. It does **not** authorize or prepare a production run (see below).
+
+**Scope:**
+- Only a missing `isActive` gets `true`, and only a missing `isAdminDeleted`
+  gets `false`. These are the defaults the rules (`get('isActive', true)`,
+  `get('isAdminDeleted', false)`), `canViewForum` and `acceptsComments`
+  already apply.
+- Explicit `true`/`false`, explicit `null`, invalid types and every other
+  field are left alone. `null` and invalid types stay manual-review items.
+- Nothing else is in scope: no timestamps, comment counts, moderation,
+  deletion, users, production mode or general framework.
+
+**Access stays the same, but the forum list changes.** Adding the defaults
+doesn't change who can open a forum: a missing flag already means listed
+and not deleted. It does change what people find. The forum list asks
+Firestore for `isActive == true` and `isAdminDeleted == false`, and an
+equality query never matches a document missing that field. So forums
+missing either flag are currently **not listed**, and correcting them
+makes them **appear in the list**. A production decision should treat this
+as a visible change, not a no-op.
+
+### Commands (emulator only)
+
+```bash
+# Start the emulator (demo project), then in another shell:
+export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
+node scripts/visibility-rehearsal/cli.mjs plan     --project demo-devtalk --backup /path/run.json
+node scripts/visibility-rehearsal/cli.mjs apply    --project demo-devtalk --backup /path/run.json
+node scripts/visibility-rehearsal/cli.mjs verify   --project demo-devtalk --backup /path/run.json
+node scripts/visibility-rehearsal/cli.mjs rollback --project demo-devtalk --backup /path/run.json
+```
+
+- **Refusals:** the tool exits 2 before any Firestore access for:
+  - an unknown command or flag (there is no production flag);
+  - a missing `--project` or `--backup`;
+  - a non-`demo-*` project;
+  - a missing, non-loopback or portless `FIRESTORE_EMULATOR_HOST`;
+  - credential variables (`GOOGLE_APPLICATION_CREDENTIALS`,
+    `FIREBASE_ADMIN_PRIVATE_KEY`, `FIREBASE_ADMIN_CLIENT_EMAIL`);
+  - a missing or invalid backup, for every command except `plan`.
+- **Target checks:** these read `process.env`, the environment the Admin
+  SDK reads, before firebase-admin is loaded. The host is checked again
+  before every database operation, so a change after validation fails
+  closed. A named Admin app is used, never `app/firebase/admin.server.ts`,
+  and metadata-server detection is off.
+- **The audit tool is unchanged and still read-only.** The rehearsal reuses
+  its `assertSafeEmulatorTarget` and its missing-flag proposals.
+
+### Artifacts and records
+
+**Backup file** (`--backup`, a local path outside the repo; written with
+mode 0600):
+- **Write once:** it is created with `wx`, so an existing file is never
+  overwritten. It is read back and validated before `plan` reports success.
+- **Contents:** `kind`, `version` 1, `migration`
+  (`forum-visibility-defaults-v1`), `runId` (random UUID), `projectId`,
+  `emulatorHost`, `createdAt`, and `documents[]`.
+  - Each document has its `path`, the `updateTime` observed when planning
+    (ISO 8601 with all nine fractional digits), `original` and `set`.
+  - `original` holds both flags' states, as `{state: "missing"}`,
+    `{state: "present", value: true|false|null}` or
+    `{state: "present", type}`. Other values are never copied.
+  - `set` holds only the defaults being added.
+- **Checksum:** a SHA-256 `checksum` over a canonical (key-sorted)
+  serialization.
+- **Validation:** `apply`, `verify` and `rollback` refuse a backup unless:
+  - the checksum matches;
+  - the kind, version and migration match;
+  - the project and emulator host match this run's target;
+  - each path is `forums/<id>`, listed once;
+  - each correction is a default for a field the backup records as missing.
+- **No content:** no titles, text, names, emails, UIDs or credentials.
+- **Survives restarts:** it is a file, and the progress records below live
+  in the emulator database, so no step depends on in-memory state.
+
+**Progress records:** `visibilityRehearsalRuns/{runId}/documents/{forumId}`,
+emulator only.
+- **Contents:** `migration`, `runId`, `path`, `backupDigest` (the backup's
+  checksum), `set` and `state` (`applied` or `restored`).
+- **Binding:** a record that doesn't match the verified backup on all of
+  these is reported as `foreign_progress_record` and is never treated as
+  completed work.
+
+### Apply, resume and rollback
+
+**Atomicity is per document, not per run.** Documents are processed one at
+a time. Each one is a single transaction that writes the forum and its
+progress record together, or neither.
+
+**Apply.** Inside each transaction:
+1. If a matching progress record exists, the document is `alreadyApplied`
+   and nothing is written.
+2. The forum is re-read with a field mask on the two flags.
+3. It is skipped as `deleted` if it is gone.
+4. It is skipped as `changed_since_plan` if its update time differs from
+   the backup, **or** its flags differ from the backed-up states. Checking
+   the update time catches a change that was later undone. Unrelated edits
+   since planning also cause a skip, deliberately; re-plan to include them.
+5. Otherwise it writes only `set` and creates the progress record.
+
+Changed documents are never re-planned during apply.
+
+**Resume and lost acknowledgements.** A run that stops partway, or whose
+commit acknowledgement is lost, is resumed by running `apply` again with
+the same backup. Committed documents have a matching record and are
+skipped, so nothing is written twice and nothing is left untracked. A
+second apply over a finished run writes nothing.
+
+**Rollback ownership.** The progress record is created in the same commit
+as the correction, so its server-assigned `createTime` equals the forum's
+update time after that commit. Rollback restores a document only if the
+forum's update time still equals that `createTime`. The check, the restore
+and the record's change to `restored` happen in one transaction. No client
+clock is involved.
+- A `FieldValue.serverTimestamp()` field is **not** used as the marker. On
+  the emulator it resolves to a whole-millisecond value taken before the
+  commit, which never equals the commit time. An emulator test pins this.
+
+**Rollback outcomes:**
+- `restored`: the added fields are deleted, because their original state
+  was missing.
+- `alreadyRestored`: the record says `restored`, so nothing is written.
+- `notApplied`: there is no record.
+- Conflicts, which are skipped and reported, never forced:
+  - `deleted`: the forum is gone. It is never recreated.
+  - `changed_after_apply`: any write after the correction, **including one
+    that restored the same values**.
+  - `foreign_progress_record`.
+- Repeating rollback is safe. Restored documents stay restored and
+  conflicts stay conflicts.
+
+**Limitations:**
+- Any later write to a corrected forum blocks its rollback, including an
+  unrelated one such as a new comment's `commentCount` increment. This is
+  conservative: ownership can't be proven, so the document is reported for
+  manual handling.
+- Rollback of a partially applied run restores only committed documents.
+- Concurrent applies or rollbacks of the same run are serialized per
+  document by Firestore transactions, but the run as a whole is not locked.
+
+`verify` is read-only. For each planned document it reports `pending`,
+`changed_since_plan`, `deleted`, `applied`, `changed_after_apply`,
+`restored`, `changed_after_restore` or `foreign_progress_record`, plus
+counts.
+
+### Synthetic fixture and expected counts
+
+The fixture is `scripts/visibility-rehearsal/fixtures/visibility-sample.json`:
+12 forums with `PRIVATE-*` content markers that must never appear in a
+plan, backup, record or report. The tests apply scripted edits between
+steps:
+- **after planning:** change `v-changed-after-plan`; change and then undo
+  `v-restored-after-plan`; delete `v-deleted-after-plan`;
+- **after apply:** change `v-changed-after-apply` and set it back to the
+  migrated value; delete `v-deleted-after-apply`.
+
+| Step | Expected (and observed on the emulator) |
+| --- | --- |
+| Inspected | 12 forums |
+| Planned | 8 documents, 13 fields; 3 manual-review items (`v-null` isActive, `v-invalid` both flags) |
+| Apply | 5 documents, 8 fields applied; 3 skipped (2 `changed_since_plan`, 1 `deleted`) |
+| Second apply | 0 writes; 5 already applied; same 3 skipped |
+| Rollback | 3 documents, 4 fields restored; 2 conflicts (`changed_after_apply`, `deleted`); 3 not applied |
+| Second rollback | 0 writes; 3 already restored; same 2 conflicts |
+
+These counts describe the fixture only. They say nothing about production.
+
+### Why this is not production readiness
+
+- **Emulator only:** it ran only on the emulator, with synthetic data.
+  Production commit-time behavior, IAM, quotas and contention were not
+  exercised.
+- **No production audit:** none has been authorized, so real counts and
+  shapes are unknown.
+- **Local backup only:** the backup is a local file holding only the
+  touched fields. A production run would also need a managed export
+  (safeguard 2) and a tested restore (safeguard 3).
+- **Discoverability is unreviewed:** making unlisted forums appear in the
+  list needs an explicit product decision.
+- **Separate approvals:** production audit, backup, apply and rollback each
+  remain separately approved actions (safeguard 9). This tool has no switch
+  for them, by design.
+
 ## Safeguards for any future data change (proposal, not implemented)
 
 Each of these needs Devyn's explicit approval, separately:
@@ -173,9 +361,11 @@ Each of these needs Devyn's explicit approval, separately:
    record of completed paths, so a partial failure can resume without
    repeating or skipping work. Each batch reports applied, skipped and
    failed counts.
-8. **Rollback:** restore a field only if it still holds the value the
-   migration wrote (a precondition again), so a legitimate later change is
-   never overwritten. Anything else is reported for manual handling.
+8. **Rollback:** restore a document only if the migration still owns it,
+   not merely if the field still holds the value the migration wrote
+   (another actor may have changed it and set it back). The visibility
+   rehearsal above uses the progress record's commit time for this.
+   Anything else is reported for manual handling.
 9. **Explicit approval for each action:** separately for the production
    audit, the backup, each correction category's apply, and any decision on
    manual-review items. Moderation of legacy content, and hiding or

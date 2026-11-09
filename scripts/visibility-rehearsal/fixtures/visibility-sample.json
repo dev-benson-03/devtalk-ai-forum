@@ -1,0 +1,67 @@
+{
+  "_comment": "Synthetic forums for the emulator-only visibility rehearsal. PRIVATE-* markers must never appear in plans, backups or reports.",
+  "forums": {
+    "v-both-missing": {
+      "title": "PRIVATE-TITLE-1",
+      "creatorName": "PRIVATE-NAME",
+      "creatorId": "PRIVATE-UID-1",
+      "commentCount": 2
+    },
+    "v-active-missing": {
+      "title": "PRIVATE-TITLE-2",
+      "creatorName": "PRIVATE-NAME",
+      "isAdminDeleted": false,
+      "commentCount": 0
+    },
+    "v-deleted-missing": {
+      "title": "PRIVATE-TITLE-3",
+      "creatorName": "PRIVATE-NAME",
+      "isActive": true
+    },
+    "v-explicit-listed": {
+      "title": "PRIVATE-TITLE-4",
+      "creatorName": "PRIVATE-NAME",
+      "isActive": true,
+      "isAdminDeleted": false
+    },
+    "v-explicit-hidden": {
+      "title": "PRIVATE-TITLE-5",
+      "creatorName": "PRIVATE-NAME",
+      "isActive": false,
+      "isAdminDeleted": true
+    },
+    "v-null": {
+      "title": "PRIVATE-TITLE-6",
+      "creatorName": "PRIVATE-NAME",
+      "isActive": null,
+      "isAdminDeleted": false
+    },
+    "v-invalid": {
+      "title": "PRIVATE-TITLE-7",
+      "creatorName": "PRIVATE-NAME",
+      "isActive": "PRIVATE-yes",
+      "isAdminDeleted": 0
+    },
+    "v-changed-after-plan": {
+      "title": "PRIVATE-TITLE-8",
+      "creatorName": "PRIVATE-NAME"
+    },
+    "v-restored-after-plan": {
+      "title": "PRIVATE-TITLE-12",
+      "creatorName": "PRIVATE-NAME"
+    },
+    "v-deleted-after-plan": {
+      "title": "PRIVATE-TITLE-9",
+      "creatorName": "PRIVATE-NAME",
+      "isAdminDeleted": false
+    },
+    "v-changed-after-apply": {
+      "title": "PRIVATE-TITLE-10",
+      "creatorName": "PRIVATE-NAME"
+    },
+    "v-deleted-after-apply": {
+      "title": "PRIVATE-TITLE-11",
+      "creatorName": "PRIVATE-NAME"
+    }
+  }
+}
