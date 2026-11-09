@@ -1,0 +1,88 @@
+{
+  "_comment": "Synthetic legacy shapes for the audit tests. Not real data. Text and names are markers that must never appear in a report.",
+  "forums": {
+    "f-ok": {
+      "title": "PRIVATE-TEXT forum title",
+      "description": "PRIVATE-TEXT description",
+      "creatorId": "uid-alice",
+      "creatorName": "PRIVATE-NAME Alice",
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": { "$timestamp": "2026-12-01T00:00:00.000Z" },
+      "commentCount": 2,
+      "moderationPolicy": "sfw-2026-11-07"
+    },
+    "f-explicit-false": {
+      "title": "PRIVATE-TEXT hidden forum",
+      "creatorName": "PRIVATE-NAME Bo",
+      "isActive": false,
+      "isAdminDeleted": false,
+      "endTime": { "$timestamp": "2026-06-01T12:30:00.000Z" },
+      "commentCount": 0,
+      "moderationPolicy": "sfw-2026-11-06"
+    },
+    "f-legacy-missing": {
+      "title": "PRIVATE-TEXT old forum",
+      "creatorName": "pat@example.com"
+    },
+    "f-bad-types": {
+      "title": "PRIVATE-TEXT typed forum",
+      "isActive": "true",
+      "isAdminDeleted": null,
+      "endTime": "2026-01-15T10:00:00Z",
+      "commentCount": -1,
+      "moderationPolicy": "approved"
+    },
+    "f-ambiguous": {
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": "01/02/2026",
+      "commentCount": 1.5
+    },
+    "f-no-zone": {
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": "2026-03-01T12:00:00",
+      "commentCount": "3",
+      "moderationPolicy": "sfw-2026-11-07"
+    },
+    "f-bad-date": {
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": "2026-02-30T00:00:00Z",
+      "commentCount": 5,
+      "moderationPolicy": "sfw-2026-11-07"
+    },
+    "f-date-only": {
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": "2026-05-01",
+      "commentCount": 0,
+      "moderationPolicy": "sfw-2026-11-07"
+    },
+    "f-number-end": {
+      "isActive": true,
+      "isAdminDeleted": true,
+      "endTime": 1767225600000,
+      "commentCount": 0,
+      "moderationPolicy": "sfw-2026-11-07"
+    },
+    "f-offset": {
+      "isActive": true,
+      "isAdminDeleted": false,
+      "endTime": "2026-07-04T18:30:00.5-04:00",
+      "moderationPolicy": "sfw-2026-11-07"
+    }
+  },
+  "comments": {
+    "c1": { "forumId": "f-ok", "content": "PRIVATE-TEXT comment one", "userName": "PRIVATE-NAME Alice", "moderationPolicy": "sfw-2026-11-07" },
+    "c2": { "forumId": "f-ok", "content": "PRIVATE-TEXT comment two", "userId": "uid-bo", "moderationPolicy": "sfw-2026-11-07" },
+    "c3": { "forumId": "f-legacy-missing", "content": "PRIVATE-TEXT legacy reply" },
+    "c4": { "content": "PRIVATE-TEXT no parent", "moderationPolicy": "sfw-2026-11-07" },
+    "c5": { "forumId": "", "content": "PRIVATE-TEXT empty parent", "moderationPolicy": "sfw-2026-11-07" },
+    "c6": { "forumId": 42, "content": "PRIVATE-TEXT numeric parent", "moderationPolicy": "sfw-2026-11-07" },
+    "c7": { "forumId": "gone", "content": "PRIVATE-TEXT orphan" },
+    "c8": { "forumId": "f-bad-types", "content": "PRIVATE-TEXT typed reply", "moderationPolicy": "sfw-2026-11-07" },
+    "c9": { "forumId": "f-offset", "content": "PRIVATE-TEXT offset reply", "moderationPolicy": "sfw-2026-11-07" }
+  }
+}
