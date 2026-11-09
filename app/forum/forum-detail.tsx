@@ -7,7 +7,8 @@ import { firebaseAuth } from "../firebase";
 import { useComments, useFirestore, useForum } from "../hooks/useFirestore";
 import TeaModal from "../message/components/TeaModal";
 import { SUPPORT_MESSAGE, isRequestReused, newRequestId, prefersAnonymous, publishErrorMessage } from "./publish-client";
-import { forumWindow, storedDateText } from "./stored-time";
+import { postingEligibility, postingUnavailableMessage } from "./posting-eligibility";
+import { storedDateText } from "./stored-time";
 
 export default function ForumDetailPage() {
     const { forumId } = useParams();
@@ -21,6 +22,8 @@ export default function ForumDetailPage() {
     const [user, setCurrentUser] = useState<any>(null);
     // One ID per draft: a retried send can't post the same message twice
     const draftRequestId = useRef<string | null>(null);
+    // Re-renders after a blocked send, so the controls reflect the new check
+    const [, setLastBlockedAt] = useState(0);
 
     // Set up auth state listener once on mount
     useEffect(() => {
@@ -39,9 +42,12 @@ export default function ForumDetailPage() {
         if (!newMessage.trim() || !forumId || !forum) return;
 
         
-        // Same rule as the server, which still makes the final decision
-        if (!forumWindow(forum.endTime, new Date()).accepting) {
-            alert("This forum has closed and no longer accepts new messages.");
+        // Same rule as the server, which still makes the final decision.
+        // A blocked send keeps the draft and its request ID.
+        const posting = postingEligibility(forum, new Date());
+        if (!posting.accepting) {
+            alert(postingUnavailableMessage(posting.reason));
+            setLastBlockedAt(Date.now());
             return;
         }
 
@@ -124,8 +130,11 @@ export default function ForumDetailPage() {
         );
     }
 
-    const { accepting, end } = forumWindow(forum.endTime, new Date());
+    // Posting, not viewing: a creator or admin may see a forum that takes no messages
+    const { accepting, end } = postingEligibility(forum, new Date());
     const status = accepting ? "Open" : "Closed";
+    // A draft typed before the forum closed stays visible (read-only) so it isn't lost
+    const showForm = accepting || newMessage !== "";
 
     return (
         <div className="min-h-screen flex flex-col">
@@ -271,7 +280,7 @@ export default function ForumDetailPage() {
                     </div>
 
                     {/* New Message Form */}
-                    {accepting && (
+                    {showForm && (
                         <div className="bg-white  rounded-xl border border-gray-200  p-6 mt-6">
                             <h2 className="text-2xl font-bold text-gray-900  mb-4">
                                 {comments.length > 0 ? "Reply to this forum" : "Be the first to comment"}
@@ -286,10 +295,17 @@ export default function ForumDetailPage() {
                                     placeholder="Write your message here..."
                                     maxLength={5000}
                                     required
+                                    readOnly={!accepting}
+                                    aria-describedby={accepting ? undefined : "posting-unavailable"}
                                 ></textarea>
+                                {!accepting && (
+                                    <p id="posting-unavailable" className="text-sm text-gray-600">
+                                        This forum isn't accepting new messages. Your draft is kept here so you can copy it.
+                                    </p>
+                                )}
                                 <button
                                     type="submit"
-                                    disabled={isSubmitting}
+                                    disabled={isSubmitting || !accepting}
                                     className="px-8 py-3 rounded-lg border-gray-800 border-2 text-gray-800 font-semibold \
                                     hover:bg-[#F47D26] hover:border-transparent hover:-translate-y-2 hover:text-white hover:shadow-[0_0_16px_4px_rgba(244,125,38,0.5)]\n                                    transition-all shadow will-change-transform m-2 disabled:bg-gray-300 disabled:text-gray-500 disabled:border-gray-300"
                                 >

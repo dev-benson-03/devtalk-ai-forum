@@ -77,7 +77,8 @@ export function storedDateText(value: unknown, style: "date" | "dateTime"): stri
  * a Timestamp means open until that instant; anything else stored there,
  * including null and a valid ISO string, means closed. `end` is set only for
  * a Timestamp, so the views never suggest a string end time is in force.
- * Visibility flags are handled by the server and the forum queries, not here.
+ * This reads endTime only: postingEligibility (posting-eligibility.ts) adds
+ * the hidden and deleted flags for the forum page.
  */
 export type ForumWindow = { accepting: boolean; end: Date | null };
 
