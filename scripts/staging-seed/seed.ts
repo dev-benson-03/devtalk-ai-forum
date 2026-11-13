@@ -1,30 +1,56 @@
 /**
  * Applies, verifies and removes the synthetic staging seed (dataset.ts).
  *
- *   apply    preflight first: any planned document that exists without this
- *            seed's marker, or any planned account whose uid or email is
- *            taken by something else, stops the run before a single write.
- *            The seed record (stagingSeed/staging-seed-v1) is written next,
- *            listing everything this seed may own, then missing accounts and
- *            documents are created with create(), never overwritten.
- *            Re-running skips what exists, so apply is idempotent.
- *   verify   read-only: what is present, missing or foreign.
- *   cleanup  deletes only documents that still carry this seed's marker and
- *            accounts whose uid and email both match the plan, then the record.
+ * Ownership. The seed record (stagingSeed/staging-seed-v1) is the ledger. It
+ * names the seed, the target and a digest of the plan, and for each account
+ * the seed created: its email, the id of the credentials file that holds its
+ * password, and "pending" (written before createUser) or "created" plus the
+ * account's creationTime (written after). An account is
+ * the seed's only when its uid and email match the plan AND its ledger entry
+ * is "created" with the same creationTime. A matching account with no entry,
+ * or with another creationTime (deleted and recreated), belongs to someone
+ * else. A "pending" entry for an existing account is uncertain: createUser
+ * may have succeeded without the seed confirming it. Foreign and uncertain
+ * accounts are never adopted, changed or deleted.
  *
- * New accounts get random passwords, returned to the caller (the CLI writes
- * them to a private file). Existing accounts keep theirs. No custom claims.
+ *   apply    preflight: a ledger for another seed, target or plan, a planned
+ *            document without this seed's marker, or a foreign or uncertain
+ *            account stops the run before any write. Then missing accounts
+ *            (password from the credential store, saved before createUser)
+ *            and documents are created, never overwritten. Re-running with
+ *            the same credential store resumes an interrupted run.
+ *   verify   read-only: what is present, missing, foreign or uncertain.
+ *   cleanup  deletes only planned documents that carry this seed's marker
+ *            and planned accounts the ledger proves the seed created, then
+ *            the ledger once nothing was skipped.
  *
+ * Limits (Firebase Auth and Firestore share no transaction):
+ *   - Between createUser succeeding and the ledger confirming it, a failure
+ *     leaves a "pending" entry; the account is then uncertain until a person
+ *     resolves it (see docs/architecture/staging.md).
+ *   - The Admin SDK reports creationTime to the second, so an account deleted
+ *     and recreated with the same uid and email within the same second as the
+ *     seed's creation is indistinguishable.
+ *   - Auth has no conditional delete: an account replaced between cleanup's
+ *     check and its deleteUser call would be deleted. The window is one
+ *     request long.
+ *
+ * Passwords never reach Firestore, logs or errors. No custom claims.
  * Type-only Firebase imports: the caller passes the Admin handles, so Node
  * runs this file as is and tests can drive it against the emulators.
  */
-import { randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Auth } from "firebase-admin/auth";
 import type { Firestore, Timestamp } from "firebase-admin/firestore";
-import type { SeedPlan, SeedValue } from "./dataset";
+import type { SeedPlan, SeedUser, SeedValue } from "./dataset";
 
 /** The Admin Auth calls the seed uses (firebase-admin's Auth satisfies it). */
 export type SeedAuth = Pick<Auth, "getUser" | "getUserByEmail" | "createUser" | "deleteUser">;
+
+export interface SeedTargetInfo {
+  kind: string;
+  projectId: string;
+}
 
 export interface SeedHandles {
   db: Firestore;
@@ -32,13 +58,25 @@ export interface SeedHandles {
   timestampFromMillis: (ms: number) => Timestamp;
   /** Throws if the target changed since validation; called before every operation. */
   guard: () => void;
+  /** The validated target; recorded in, and checked against, the ledger. */
+  target: SeedTargetInfo;
+}
+
+/** Where apply gets each new account's password (credentials.ts). */
+export interface CredentialStore {
+  /** Identifies the credentials file; recorded in each ledger entry so recovery knows which file holds the password. */
+  readonly id: string;
+  /** The password recorded for this account, or a new one saved durably before it is returned. */
+  passwordFor(user: SeedUser): string;
+  /** Records that the account was created and the ledger confirmed it. Idempotent. */
+  markCreated(uid: string): void;
 }
 
 export interface SeedReport {
   documents: { created: number; existing: number };
   users: { created: number; existing: number };
-  /** Passwords for accounts created in this run only. Never logged. */
-  newCredentials: { email: string; password: string }[];
+  /** Accounts created in this run. Passwords stay in the credential store. */
+  createdUids: string[];
 }
 
 export class SeedConflict extends Error {
@@ -60,8 +98,15 @@ function materialize(value: SeedValue, h: SeedHandles): unknown {
   return value;
 }
 
+/** Identifies the plan (seed, accounts, paths), so a ledger or credentials file from another plan is rejected. */
+export function planDigest(plan: SeedPlan): string {
+  const identity = { seed: plan.seed, users: plan.users.map((u) => [u.uid, u.email]), paths: plan.documents.map((d) => d.path) };
+  return createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex");
+}
+
 const errorCode = (error: unknown) => (error as { code?: unknown })?.code;
 const isNotFound = (error: unknown) => errorCode(error) === "auth/user-not-found";
+const creationTimeOf = (user: unknown) => (user as { metadata?: { creationTime?: unknown } } | null)?.metadata?.creationTime;
 
 async function findUser(h: SeedHandles, uid: string) {
   h.guard();
@@ -83,8 +128,78 @@ async function findUserByEmail(h: SeedHandles, email: string) {
   }
 }
 
+// ---- Ledger -------------------------------------------------------------
+
+/** credentialsId names the credentials file that holds the account's password (never the password itself). */
+type AccountEntry =
+  | { email: string; credentialsId: string; state: "pending" }
+  | { email: string; credentialsId: string; state: "created"; creationTime: string };
+type Ledger = { state: "absent" } | { state: "valid"; accounts: Record<string, AccountEntry> } | { state: "invalid"; reason: string };
+
+const recordPath = (plan: SeedPlan) => `stagingSeed/${plan.seed}`;
+
+function parseAccounts(plan: SeedPlan, raw: unknown): Record<string, AccountEntry> | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const planned = new Map(plan.users.map((u) => [u.uid, u.email]));
+  const accounts: Record<string, AccountEntry> = {};
+  for (const [uid, value] of Object.entries(raw)) {
+    const entry = value as Partial<{ email: unknown; credentialsId: unknown; state: unknown; creationTime: unknown }>;
+    if (planned.get(uid) === undefined || entry?.email !== planned.get(uid)) return null;
+    const { email, credentialsId } = entry;
+    if (typeof email !== "string" || typeof credentialsId !== "string" || !credentialsId) return null;
+    if (entry.state === "pending") accounts[uid] = { email, credentialsId, state: "pending" };
+    else if (entry.state === "created" && typeof entry.creationTime === "string" && entry.creationTime) {
+      accounts[uid] = { email, credentialsId, state: "created", creationTime: entry.creationTime };
+    } else return null;
+  }
+  return accounts;
+}
+
+/** The ledger, validated against this plan and target. Unknown fields or values make it invalid, never trusted. */
+function interpretLedger(plan: SeedPlan, h: SeedHandles, data: Record<string, unknown> | undefined): Ledger {
+  if (!data) return { state: "absent" };
+  const target = data.target as Partial<SeedTargetInfo> | undefined;
+  if (data.seed !== plan.seed) return { state: "invalid", reason: "it names another seed" };
+  if (target?.kind !== h.target.kind || target?.projectId !== h.target.projectId) return { state: "invalid", reason: "it names another target" };
+  if (data.planDigest !== planDigest(plan)) return { state: "invalid", reason: "it was written for another plan" };
+  const accounts = parseAccounts(plan, data.accounts ?? {});
+  if (!accounts) return { state: "invalid", reason: "its account entries do not match the plan" };
+  return { state: "valid", accounts };
+}
+
+async function readLedger(plan: SeedPlan, h: SeedHandles): Promise<Ledger> {
+  h.guard();
+  const snap = await h.db.doc(recordPath(plan)).get();
+  return interpretLedger(plan, h, snap.exists ? snap.data() : undefined);
+}
+
+/**
+ * Sets one account's entry, re-validating the ledger in the same
+ * transaction. Only two transitions are allowed, both for this credentials
+ * file: (none, or any entry of this file) -> pending, made only for a missing
+ * account, and this file's pending -> created. Anything
+ * else means another apply (with another credentials file) is working on the
+ * same account, and this run stops.
+ */
+async function setAccountEntry(plan: SeedPlan, h: SeedHandles, uid: string, entry: AccountEntry) {
+  h.guard();
+  const ref = h.db.doc(recordPath(plan));
+  await h.db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const ledger = interpretLedger(plan, h, snap.exists ? snap.data() : undefined);
+    if (ledger.state !== "valid") throw new SeedConflict(`the seed record changed during apply (${ledger.state})`);
+    const current = ledger.accounts[uid];
+    const ownPending = current?.state === "pending" && current.credentialsId === entry.credentialsId;
+    const allowed = entry.state === "pending" ? !current || current.credentialsId === entry.credentialsId : ownPending;
+    if (!allowed) throw new SeedConflict(`auth/${uid}'s ledger entry was changed by another apply; stopping`);
+    tx.update(ref, { accounts: { ...ledger.accounts, [uid]: entry }, updatedAt: h.timestampFromMillis(Date.now()) });
+  });
+}
+
+// ---- State --------------------------------------------------------------
+
 type DocState = "missing" | "seeded" | "foreign";
-type UserState = "missing" | "seeded" | "foreign";
+type UserState = "missing" | "seeded" | "foreign" | "uncertain";
 
 async function documentStates(plan: SeedPlan, h: SeedHandles): Promise<Map<string, DocState>> {
   const states = new Map<string, DocState>();
@@ -96,73 +211,115 @@ async function documentStates(plan: SeedPlan, h: SeedHandles): Promise<Map<strin
   return states;
 }
 
-async function userStates(plan: SeedPlan, h: SeedHandles): Promise<Map<string, UserState>> {
+async function userState(user: SeedUser, h: SeedHandles, ledger: Ledger): Promise<UserState> {
+  const byUid = await findUser(h, user.uid);
+  const byEmail = await findUserByEmail(h, user.email);
+  if (!byUid && !byEmail) return "missing";
+  if (!byUid || !byEmail || byUid.uid !== byEmail.uid) return "foreign";
+  const entry = ledger.state === "valid" ? ledger.accounts[user.uid] : undefined;
+  if (entry?.state === "created" && entry.creationTime === creationTimeOf(byUid)) return "seeded";
+  if (entry?.state === "pending") return "uncertain";
+  return "foreign";
+}
+
+async function userStates(plan: SeedPlan, h: SeedHandles, ledger: Ledger): Promise<Map<string, UserState>> {
   const states = new Map<string, UserState>();
-  for (const user of plan.users) {
-    const byUid = await findUser(h, user.uid);
-    const byEmail = await findUserByEmail(h, user.email);
-    if (!byUid && !byEmail) states.set(user.uid, "missing");
-    else if (byUid && byEmail && byUid.uid === byEmail.uid) states.set(user.uid, "seeded");
-    else states.set(user.uid, "foreign");
-  }
+  for (const user of plan.users) states.set(user.uid, await userState(user, h, ledger));
   return states;
 }
 
+const named = <S>(states: Map<string, S>, state: S, prefix = "") => [...states].filter(([, s]) => s === state).map(([k]) => `${prefix}${k}`);
+
 /** Read-only status of every planned account and document. */
 export async function verifySeed(plan: SeedPlan, h: SeedHandles) {
+  const ledger = await readLedger(plan, h);
   const docs = await documentStates(plan, h);
-  const users = await userStates(plan, h);
-  h.guard();
-  const record = await h.db.doc(recordPath(plan)).get();
-  const tally = (states: Map<string, string>) => {
-    const counts = { missing: 0, seeded: 0, foreign: 0 };
-    for (const state of states.values()) counts[state as keyof typeof counts]++;
-    return counts;
-  };
+  const users = await userStates(plan, h, ledger);
+  const tally = <S extends string>(states: Map<string, S>, keys: S[]) =>
+    Object.fromEntries(keys.map((k) => [k, named(states, k).length])) as Record<S, number>;
+  let record = ledger.state;
+  if (ledger.state === "valid") {
+    h.guard();
+    record = (await h.db.doc(recordPath(plan)).get()).get("status");
+  }
   return {
-    record: record.exists ? (record.get("status") as string) : "absent",
-    documents: tally(docs),
-    users: tally(users),
-    foreign: [...docs].filter(([, s]) => s === "foreign").map(([p]) => p).concat([...users].filter(([, s]) => s === "foreign").map(([u]) => `auth/${u}`)),
+    record,
+    documents: tally(docs, ["missing", "seeded", "foreign"]),
+    users: tally(users, ["missing", "seeded", "foreign", "uncertain"]),
+    foreign: named(docs, "foreign").concat(named(users, "foreign", "auth/")),
+    uncertain: named(users, "uncertain", "auth/"),
   };
 }
 
-const recordPath = (plan: SeedPlan) => `stagingSeed/${plan.seed}`;
+// ---- Apply --------------------------------------------------------------
 
-export async function applySeed(plan: SeedPlan, h: SeedHandles, makePassword = () => randomBytes(18).toString("base64url")): Promise<SeedReport> {
-  // 1. Preflight: refuse before any write if anything planned belongs to someone else
+export async function applySeed(plan: SeedPlan, h: SeedHandles, credentials: CredentialStore): Promise<SeedReport> {
+  // 1. Preflight: refuse before any write unless everything planned is missing or provably this seed's
+  const ledger = await readLedger(plan, h);
+  if (ledger.state === "invalid") throw new SeedConflict(`the seed record ${recordPath(plan)} does not belong to this run: ${ledger.reason}`);
   const docs = await documentStates(plan, h);
-  const users = await userStates(plan, h);
-  const foreign = [...docs].filter(([, s]) => s === "foreign").map(([p]) => p)
-    .concat([...users].filter(([, s]) => s === "foreign").map(([u]) => `auth/${u}`));
-  if (foreign.length > 0) throw new SeedConflict(`planned records exist without this seed's marker: ${foreign.join(", ")}`);
+  const users = await userStates(plan, h, ledger);
+  const foreign = named(docs, "foreign").concat(named(users, "foreign", "auth/"));
+  if (foreign.length > 0) throw new SeedConflict(`planned records exist that this seed cannot prove it created: ${foreign.join(", ")}`);
+  // A pending entry for a missing account belongs to the run that wrote it: continue only with that credentials file
+  const otherFile = plan.users
+    .filter((u) => users.get(u.uid) === "missing" && ledger.state === "valid" && ledger.accounts[u.uid] && ledger.accounts[u.uid].credentialsId !== credentials.id)
+    .map((u) => `auth/${u.uid}`);
+  if (otherFile.length > 0) {
+    throw new SeedConflict(
+      `an earlier run saved passwords for ${otherFile.join(", ")} in another credentials file; ` +
+        "resume with that file (--resume), or run cleanup first"
+    );
+  }
+  const uncertain = named(users, "uncertain", "auth/");
+  if (uncertain.length > 0) {
+    throw new SeedConflict(
+      `an earlier run may have created ${uncertain.join(", ")} without confirming it; left untouched. ` +
+        "See 'Recovering an interrupted apply' in docs/architecture/staging.md."
+    );
+  }
 
-  // 2. Record what this seed may own, before creating it
+  // 2. The ledger exists before any account or document does
   h.guard();
-  await h.db.doc(recordPath(plan)).set(
-    {
+  const ref = h.db.doc(recordPath(plan));
+  const now = () => h.timestampFromMillis(Date.now());
+  if (ledger.state === "absent") {
+    await ref.create({
       seed: plan.seed,
+      target: { kind: h.target.kind, projectId: h.target.projectId },
+      planDigest: planDigest(plan),
       status: "applying",
       paths: plan.documents.map((d) => d.path),
-      userUids: plan.users.map((u) => u.uid),
-      userEmails: plan.users.map((u) => u.email),
-      updatedAt: h.timestampFromMillis(Date.now()),
-    },
-    { merge: true }
-  );
+      accounts: {},
+      updatedAt: now(),
+    });
+  } else {
+    await ref.update({ status: "applying", updatedAt: now() });
+  }
 
-  // 3. Accounts: create missing ones, never modify existing ones, no claims
-  const report: SeedReport = { documents: { created: 0, existing: 0 }, users: { created: 0, existing: 0 }, newCredentials: [] };
+  // 3. Accounts: password saved, ledger "pending", createUser, ledger "created". Existing accounts are never modified.
+  const report: SeedReport = { documents: { created: 0, existing: 0 }, users: { created: 0, existing: 0 }, createdUids: [] };
   for (const user of plan.users) {
     if (users.get(user.uid) === "seeded") {
+      // An earlier run with this credentials file may have stopped between the ledger and the file
+      const entry = ledger.state === "valid" ? ledger.accounts[user.uid] : undefined;
+      if (entry?.credentialsId === credentials.id) credentials.markCreated(user.uid);
       report.users.existing++;
       continue;
     }
-    const password = makePassword();
+    const password = credentials.passwordFor(user);
+    const credentialsId = credentials.id;
+    await setAccountEntry(plan, h, user.uid, { email: user.email, credentialsId, state: "pending" });
     h.guard();
-    await h.auth.createUser({ uid: user.uid, email: user.email, displayName: user.displayName, password, emailVerified: false });
+    const created = await h.auth.createUser({ uid: user.uid, email: user.email, displayName: user.displayName, password, emailVerified: false });
+    const creationTime = creationTimeOf(created);
+    if (typeof creationTime !== "string" || !creationTime) {
+      throw new SeedConflict(`auth/${user.uid} was created but reported no creation time; its ownership stays pending`);
+    }
+    await setAccountEntry(plan, h, user.uid, { email: user.email, credentialsId, state: "created", creationTime });
+    credentials.markCreated(user.uid);
     report.users.created++;
-    report.newCredentials.push({ email: user.email, password });
+    report.createdUids.push(user.uid);
   }
 
   // 4. Documents: create() fails rather than overwrite something written meanwhile
@@ -177,38 +334,42 @@ export async function applySeed(plan: SeedPlan, h: SeedHandles, makePassword = (
   }
 
   h.guard();
-  await h.db.doc(recordPath(plan)).update({ status: "applied", updatedAt: h.timestampFromMillis(Date.now()) });
+  await ref.update({ status: "applied", updatedAt: now() });
   return report;
 }
 
-/** Removes only what this seed owns: marked documents and matching accounts. */
+// ---- Cleanup ------------------------------------------------------------
+
+/**
+ * Removes only what this seed provably owns: planned documents that carry its
+ * marker, and planned accounts its ledger confirms it created. Never acts on
+ * paths or accounts that only the ledger lists.
+ */
 export async function cleanupSeed(plan: SeedPlan, h: SeedHandles) {
-  h.guard();
-  const record = await h.db.doc(recordPath(plan)).get();
-  const paths: string[] = record.exists ? (record.get("paths") as string[]) : plan.documents.map((d) => d.path);
+  const ledger = await readLedger(plan, h);
+  if (ledger.state === "invalid") throw new SeedConflict(`the seed record ${recordPath(plan)} does not belong to this run: ${ledger.reason}`);
   const removed = { documents: 0, users: 0, skipped: [] as string[] };
 
-  for (const path of paths) {
+  for (const { path } of plan.documents) {
     h.guard();
     const ref = h.db.doc(path);
-    const deleted = await h.db.runTransaction(async (tx) => {
+    // The callback may run more than once; only its final result counts
+    const outcome = await h.db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
-      if (!snap.exists) return false;
-      if (snap.get("seed") !== plan.seed) {
-        removed.skipped.push(path);
-        return false;
-      }
+      if (!snap.exists) return "missing";
+      if (snap.get("seed") !== plan.seed) return "foreign";
       tx.delete(ref);
-      return true;
+      return "deleted";
     });
-    if (deleted) removed.documents++;
+    if (outcome === "deleted") removed.documents++;
+    if (outcome === "foreign") removed.skipped.push(path);
   }
 
   for (const user of plan.users) {
-    const existing = await findUser(h, user.uid);
-    if (!existing) continue;
-    if (existing.email !== user.email) {
-      removed.skipped.push(`auth/${user.uid}`);
+    const state = await userState(user, h, ledger);
+    if (state === "missing") continue;
+    if (state !== "seeded") {
+      removed.skipped.push(`auth/${user.uid} (${state})`);
       continue;
     }
     h.guard();
@@ -216,7 +377,7 @@ export async function cleanupSeed(plan: SeedPlan, h: SeedHandles) {
     removed.users++;
   }
 
-  if (removed.skipped.length === 0) {
+  if (removed.skipped.length === 0 && ledger.state === "valid") {
     h.guard();
     await h.db.doc(recordPath(plan)).delete();
   }

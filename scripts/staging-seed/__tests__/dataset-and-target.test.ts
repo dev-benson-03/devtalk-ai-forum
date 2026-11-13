@@ -3,9 +3,12 @@
  *
  * The staging seed's data and target checks. Nothing here loads
  * firebase-admin or talks to Firebase; the CLI cases all refuse before that.
+ * The credentials file itself is tested in credentials.test.ts.
  * The emulator end-to-end run is in tests/firestore-rules/staging-seed.test.ts.
  */
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { analysisCacheKey, ANALYSIS_VERSION } from "../../../app/api/analysis-cache.server";
 import { selectForAnalysis, toTrustedComment } from "../../../app/api/analysis-comments";
@@ -189,5 +192,88 @@ describe("cli.mjs", () => {
     const result = run(args, { FIRESTORE_EMULATOR_HOST: "127.0.0.1:1", FIREBASE_AUTH_EMULATOR_HOST: "127.0.0.1:1", DEVTALK_FIREBASE_ENV: "staging" });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("Refusing to run");
+  });
+
+  describe("--credentials-out", () => {
+    // Unreachable emulator ports: a run that got past the refusal would fail differently (exit 1), never exit 2
+    const EMULATORS = { FIRESTORE_EMULATOR_HOST: "127.0.0.1:1", FIREBASE_AUTH_EMULATOR_HOST: "127.0.0.1:1" };
+    const apply = (...extra: string[]) => run(["apply", "--target", "emulator", "--project", "demo-devtalk", ...extra], EMULATORS);
+    let dir: string;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "seed-cli-"));
+    });
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it.each([
+      ["a missing directory", () => [join(dir, "missing", "creds.json")], "does not exist"],
+      ["a directory that is a file", () => (writeFileSync(join(dir, "f"), ""), [join(dir, "f", "creds.json")]), "does not exist"],
+      ["an existing file without --resume", () => (writeFileSync(join(dir, "notes.txt"), "keep me\n"), [join(dir, "notes.txt")]), "already exists"],
+      ["--resume without an existing file", () => [join(dir, "creds.json"), "--resume"], "needs an existing"],
+      ["--resume with an unrelated file", () => (writeFileSync(join(dir, "notes.txt"), "keep me\n", { mode: 0o600 }), [join(dir, "notes.txt"), "--resume"]), "not a seed credentials file"],
+    ])("refuses %s before connecting, leaving the directory as it was", (_label, setup, message) => {
+      const [path, ...rest] = setup();
+      const before = readdirSync(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]);
+      const result = apply("--credentials-out", path, ...rest);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain("--credentials-out: ");
+      expect(result.stderr).toContain(message);
+      expect(readdirSync(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")])).toEqual(before);
+    });
+
+    it.each([["--resume"], ["--recover-stale-lock"]])("accepts %s only for apply", (flag) => {
+      const result = run(["verify", "--target", "emulator", "--project", "demo-devtalk", flag], EMULATORS);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(`${flag} applies only to apply`);
+    });
+
+    it("refuses, before connecting, a credentials file another apply holds", () => {
+      const path = join(dir, "creds.json");
+      // Another session holds the file: a lock as credentials.ts writes it, for this (live) test process
+      writeFileSync(path, "{}", { mode: 0o600 });
+      const lock = JSON.stringify({ format: "devtalk-staging-seed-credentials-lock", token: "held", pid: process.pid, host: hostname(), startedAt: "now" });
+      writeFileSync(`${path}.lock`, lock, { mode: 0o600 });
+      for (const extra of [[], ["--resume"], ["--resume", "--recover-stale-lock"]]) {
+        const result = apply("--credentials-out", path, ...extra);
+        expect(result.status).toBe(2);
+        expect(result.stderr).toMatch(/in use by process|still running/);
+        expect(readFileSync(`${path}.lock`, "utf8")).toBe(lock);
+        expect(readFileSync(path, "utf8")).toBe("{}");
+      }
+    });
+
+    it("releases the lock when the SDK cannot start, without any network access", () => {
+      // A synthetic, unparseable service-account key makes firebase-admin's cert() throw before any request.
+      // The preload refuses every non-loopback connection and DNS lookup, and records any attempt.
+      const log = join(dir, "network.log");
+      const preload = join(dir, "no-network.cjs");
+      writeFileSync(
+        preload,
+        `const net = require("net"), dns = require("dns"), fs = require("fs");
+         const note = (m) => fs.appendFileSync(${JSON.stringify(log)}, m + "\\n");
+         const connect = net.Socket.prototype.connect;
+         net.Socket.prototype.connect = function (...a) { const o = typeof a[0] === "object" ? a[0] : { host: a[1] };
+           if (!o.path && !/^(127\\.|localhost$|::1$)/.test(o.host || "localhost")) { note("connect " + o.host); throw new Error("network blocked"); }
+           return connect.apply(this, a); };
+         const lookup = dns.lookup; dns.lookup = function (h, ...r) { note("dns " + h); return r[r.length - 1](new Error("network blocked")); };
+         note("loaded");`
+      );
+      const path = join(dir, "creds.json");
+      const result = run(
+        ["apply", "--target", "staging", "--project", STAGING_PROJECT, "--confirm", STAGING_PROJECT, "--credentials-out", path],
+        {
+          DEVTALK_FIREBASE_ENV: "staging",
+          FIREBASE_ADMIN_CLIENT_EMAIL: "synthetic-test@devtalk-staging.iam.gserviceaccount.com",
+          FIREBASE_ADMIN_PRIVATE_KEY: "synthetic-not-a-private-key",
+          NODE_OPTIONS: `--require ${preload}`,
+        }
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Seed failed");
+      expect(readdirSync(dir).sort()).toEqual(["creds.json", "network.log", "no-network.cjs"]); // no lock left
+      expect(JSON.parse(readFileSync(path, "utf8")).accounts).toEqual({});
+      expect(readFileSync(log, "utf8").trim()).toBe("loaded");
+    });
   });
 });
