@@ -106,3 +106,50 @@ describe("readAdminOptions", () => {
     expect(cert).not.toHaveBeenCalled();
   });
 });
+
+describe("readAdminOptions across production and staging", () => {
+  const STAGING = "devtalk-staging";
+  const STAGING_EMAIL = "devtalk-staging-server@devtalk-staging.iam.gserviceaccount.com";
+  const serviceAccount = (projectId: string, clientEmail: string, deployment: Record<string, string>) => ({
+    FIREBASE_ADMIN_PROJECT_ID: projectId,
+    FIREBASE_ADMIN_CLIENT_EMAIL: clientEmail,
+    FIREBASE_ADMIN_PRIVATE_KEY: FAKE_KEY,
+    ...deployment,
+  });
+  const PREVIEW = { VERCEL_ENV: "preview", DEVTALK_FIREBASE_ENV: "staging", VITE_FIREBASE_PROJECT_ID: STAGING };
+  const PRODUCTION = { VERCEL_ENV: "production", DEVTALK_FIREBASE_ENV: "production", VITE_FIREBASE_PROJECT_ID: PROJECT };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it("accepts a staging service account in a Preview", () => {
+    const options = readAdminOptions(serviceAccount(STAGING, STAGING_EMAIL, PREVIEW), noFile);
+    expect(options.projectId).toBe(STAGING);
+    expect(cert).toHaveBeenCalledWith(expect.objectContaining({ projectId: STAGING, clientEmail: STAGING_EMAIL }));
+  });
+
+  it("accepts a production service account in Production", () => {
+    expect(readAdminOptions(serviceAccount(PROJECT, EMAIL, PRODUCTION), noFile).projectId).toBe(PROJECT);
+  });
+
+  it.each([
+    ["production credentials in a Preview", serviceAccount(PROJECT, EMAIL, PREVIEW)],
+    ["staging credentials in Production", serviceAccount(STAGING, STAGING_EMAIL, PRODUCTION)],
+    ["a production service account under the staging project ID", serviceAccount(STAGING, EMAIL, PREVIEW)],
+    ["a staging service account under the production project ID", serviceAccount(PROJECT, STAGING_EMAIL, PRODUCTION)],
+    ["a staging browser config with production Admin", serviceAccount(PROJECT, EMAIL, { VITE_FIREBASE_PROJECT_ID: STAGING })],
+    ["conflicting environment declarations", serviceAccount(STAGING, STAGING_EMAIL, { VERCEL_ENV: "production", DEVTALK_FIREBASE_ENV: "staging" })],
+    ["an unknown project", serviceAccount("devtalk-staging-2", "x@devtalk-staging-2.iam.gserviceaccount.com", {})],
+  ])("refuses %s without echoing secrets", (_label, env) => {
+    const error = errorFrom(() => readAdminOptions(env, noFile));
+    expect(error).toBeInstanceOf(AdminConfigError);
+    expect(error.message).not.toContain("FAKE-KEY-BODY");
+    expect(cert).not.toHaveBeenCalled();
+  });
+
+  it("stops ADC in a Preview from pointing at production", () => {
+    const env = { FIREBASE_ADMIN_PROJECT_ID: STAGING, GOOGLE_CLOUD_PROJECT: PROJECT, ...PREVIEW };
+    expect(errorFrom(() => readAdminOptions(env, noFile)).message).toBe(
+      "GOOGLE_CLOUD_PROJECT does not match FIREBASE_ADMIN_PROJECT_ID."
+    );
+  });
+});

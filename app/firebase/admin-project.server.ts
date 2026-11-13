@@ -3,8 +3,19 @@
  * initializes the SDK. Errors are safe to log; they never include env values.
  */
 
-/** Projects this deployment may operate on. The capstone project is excluded. */
-export const ALLOWED_ADMIN_PROJECT_IDS: readonly string[] = ["devtalk-88046"];
+import {
+  assertProjectForDeployment,
+  assertWebProjectMatchesAdmin,
+  FirebaseProjectError,
+  knownProjectIds,
+} from "./projects";
+
+/**
+ * Projects this app may operate on (production, plus staging once it exists).
+ * The capstone project is excluded. Which one a deployment may use is decided
+ * by assertProjectForDeployment (projects.ts).
+ */
+export const ALLOWED_ADMIN_PROJECT_IDS: readonly string[] = knownProjectIds();
 
 export const ADMIN_PROJECT_ENV = "FIREBASE_ADMIN_PROJECT_ID";
 
@@ -17,14 +28,22 @@ export class AdminConfigError extends Error {
   }
 }
 
-/** Returns the explicit, allow-listed project ID or throws AdminConfigError. */
+/**
+ * Returns the explicit project ID or throws AdminConfigError. It must be the
+ * deployment's project when the deployment declares an environment, one of
+ * ours otherwise, and the browser config's project when that is visible.
+ */
 export function readAdminProjectId(env: Partial<Record<string, string | undefined>>): string {
   const projectId = env[ADMIN_PROJECT_ENV]?.trim();
   if (!projectId) {
     throw new AdminConfigError(`${ADMIN_PROJECT_ENV} must be set.`);
   }
-  if (!ALLOWED_ADMIN_PROJECT_IDS.includes(projectId)) {
-    throw new AdminConfigError(`${ADMIN_PROJECT_ENV} is not an allowed project for this deployment.`);
+  try {
+    assertProjectForDeployment(env, ADMIN_PROJECT_ENV, projectId);
+    assertWebProjectMatchesAdmin(env, projectId);
+  } catch (error) {
+    if (error instanceof FirebaseProjectError) throw new AdminConfigError(error.message);
+    throw error;
   }
   return projectId;
 }
