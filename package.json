@@ -15,8 +15,8 @@
     "test:rules": "firebase emulators:exec --only firestore --project demo-devtalk \"jest --config jest.rules.config.cjs\""
   },
   "dependencies": {
-    "@react-router/node": "^7.9.2",
-    "@react-router/serve": "^7.9.2",
+    "@react-router/node": "^7.18.5",
+    "@react-router/serve": "^7.18.5",
     "@testing-library/dom": "^10.4.1",
     "firebase": "^12.4.0",
     "firebase-admin": "^14.5.0",
@@ -25,12 +25,12 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-icons": "^5.5.0",
-    "react-router": "^7.9.2"
+    "react-router": "^7.18.5"
   },
   "devDependencies": {
     "@babel/preset-env": "^7.28.5",
     "@firebase/rules-unit-testing": "5.0.2",
-    "@react-router/dev": "^7.9.2",
+    "@react-router/dev": "^7.18.5",
     "@tailwindcss/vite": "^4.1.13",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.0",
