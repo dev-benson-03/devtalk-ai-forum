@@ -12,7 +12,7 @@
     "typecheck": "react-router typegen && tsc",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:rules": "firebase emulators:exec --only firestore --project demo-devtalk \"jest --config jest.rules.config.cjs\""
+    "test:rules": "firebase emulators:exec --only firestore,auth --project demo-devtalk \"jest --config jest.rules.config.cjs\""
   },
   "dependencies": {
     "@react-router/node": "^7.18.5",
