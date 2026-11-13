@@ -44,6 +44,42 @@ describe("readAdminProjectId", () => {
   );
 });
 
+describe("readAdminProjectId per deployment", () => {
+  const PROD = "devtalk-88046";
+
+  it("accepts production credentials in a Production deployment", () => {
+    const env = { FIREBASE_ADMIN_PROJECT_ID: PROD, VERCEL_ENV: "production", DEVTALK_FIREBASE_ENV: "production" };
+    expect(readAdminProjectId(env)).toBe(PROD);
+  });
+
+  it.each([
+    [{ VERCEL_ENV: "preview" }],
+    [{ VERCEL_ENV: "development" }],
+    [{ DEVTALK_FIREBASE_ENV: "staging" }],
+  ])("refuses production credentials in a staging deployment (%j)", (deployment) => {
+    const error = errorFrom(() => readAdminProjectId({ FIREBASE_ADMIN_PROJECT_ID: PROD, ...deployment }));
+    expect(error).toBeInstanceOf(AdminConfigError);
+    expect(error.code).toBe("admin/invalid-config");
+    expect(error.message).not.toContain(PROD);
+  });
+
+  it("refuses when the declared environment contradicts Vercel's", () => {
+    const env = { FIREBASE_ADMIN_PROJECT_ID: PROD, VERCEL_ENV: "preview", DEVTALK_FIREBASE_ENV: "production" };
+    expect(errorFrom(() => readAdminProjectId(env)).message).toBe("DEVTALK_FIREBASE_ENV does not match VERCEL_ENV.");
+  });
+
+  it("refuses a browser config for another project", () => {
+    const env = { FIREBASE_ADMIN_PROJECT_ID: PROD, VITE_FIREBASE_PROJECT_ID: "devtalk-staging-x" };
+    const error = errorFrom(() => readAdminProjectId(env));
+    expect(error).toBeInstanceOf(AdminConfigError);
+    expect(error.message).toBe("VITE_FIREBASE_PROJECT_ID does not match the Admin project.");
+  });
+
+  it("accepts a matching browser config", () => {
+    expect(readAdminProjectId({ FIREBASE_ADMIN_PROJECT_ID: PROD, VITE_FIREBASE_PROJECT_ID: PROD })).toBe(PROD);
+  });
+});
+
 describe("assertServiceAccountProject", () => {
   it("accepts a service account from the configured project", () => {
     expect(() =>

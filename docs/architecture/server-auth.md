@@ -117,7 +117,8 @@ Vercel has no ADC, so the server needs a credential from env. Two options:
 
 | Name | Needed when | Notes |
 | --- | --- | --- |
-| `FIREBASE_ADMIN_PROJECT_ID` | Always (required) | Must be `devtalk-88046` |
+| `FIREBASE_ADMIN_PROJECT_ID` | Always (required) | The deployment's project: `devtalk-88046` (production) or `devtalk-staging` (Preview) |
+| `DEVTALK_FIREBASE_ENV` | Vercel (recommended) | `production` or `staging`; must agree with `VERCEL_ENV` |
 | `FIREBASE_ADMIN_CLIENT_EMAIL` | Vercel (option 1) | Service-account email |
 | `FIREBASE_ADMIN_PRIVATE_KEY` | Vercel (option 1) | PEM key; literal `\n` is converted to newlines |
 
@@ -126,13 +127,14 @@ the missing variables (never values).
 
 ## Project isolation (Phase 1.1)
 
-- `FIREBASE_ADMIN_PROJECT_ID` is required, trimmed, and must be in
-  `ALLOWED_ADMIN_PROJECT_IDS` (`devtalk-88046` only). `codesocietycapstone`
-  and any other value are rejected.
+- `FIREBASE_ADMIN_PROJECT_ID` is required, trimmed, and must be one of the
+  projects in `app/firebase/projects.ts`: `devtalk-88046` (production) and
+  `devtalk-staging` (Vercel Preview). `codesocietycapstone` and any other
+  value are rejected. See "Staging and production projects" below.
 - The validated ID is always passed to `initializeApp`, so Auth (token
   audience) and Firestore target it rather than whatever ADC would infer.
 - Service-account mode: `FIREBASE_ADMIN_CLIENT_EMAIL` must end in
-  `@devtalk-88046.iam.gserviceaccount.com`.
+  `@<project>.iam.gserviceaccount.com` for the validated project.
 - ADC mode: `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT`, if set, must match, and a
   key file named by `GOOGLE_APPLICATION_CREDENTIALS` must not carry another
   `project_id`. Gcloud user logins and federated (`external_account`) files
@@ -141,6 +143,40 @@ the missing variables (never values).
 - A cached Admin app whose project differs from the current config is refused.
 - All failures are `AdminConfigError` (`admin/invalid-config`) with messages
   that name variables, never values. `requireUser` turns them into a 500.
+
+## Staging and production projects
+
+`app/firebase/projects.ts` maps each deployment environment to exactly one
+Firebase project:
+
+| Environment | Project | Declared by |
+| --- | --- | --- |
+| production | `devtalk-88046` | `DEVTALK_FIREBASE_ENV=production`, or `VERCEL_ENV=production` |
+| staging | `devtalk-staging` (`STAGING_PROJECT_ID`) | `DEVTALK_FIREBASE_ENV=staging`, or `VERCEL_ENV=preview`/`development` |
+
+- **Two independent signals:** `DEVTALK_FIREBASE_ENV` is set by us per
+  Vercel environment; `VERCEL_ENV` is a Vercel system variable (build and
+  runtime). When both are present they must agree; a disagreement is an error.
+- **Declared deployment:** the Admin project, and at build time the browser
+  project, must be that environment's project. Production credentials in a
+  Preview are refused, and so is staging in Production. Setting a project
+  to `null` in the map refuses every deployment of that environment.
+- **Undeclared (local, tests, Docker):** the project only has to be one of
+  ours, as before.
+- **Build-time check** (`vite.config.ts`, `assertWebConfigForDeployment`):
+  when an environment is declared, `VITE_FIREBASE_PROJECT_ID` must be its
+  project; the SHA-256 of `VITE_FIREBASE_API_KEY` must equal that
+  environment's pinned `apiKeySha256`; and the app ID, sender ID, auth
+  domain, bucket and project must equal its recorded values in
+  `app/firebase/web-config-bindings.ts`. The fingerprint is computed by the
+  owner outside the build (see staging.md) and never derived from the
+  variable being checked. A `null` binding or a missing or malformed
+  fingerprint refuses the build. This stops a production API key from
+  passing a Preview build whose other fields name staging.
+- **Runtime check:** if `VITE_FIREBASE_PROJECT_ID` is visible to the server
+  (it is on Vercel), it must equal the Admin project. Independently, the
+  Admin SDK's `verifyIdToken` rejects ID tokens issued for another project.
+- Messages name variables and environments, never project IDs or secrets.
 
 ## Authentication error classification (Phase 1.1)
 
